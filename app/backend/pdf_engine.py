@@ -36,7 +36,14 @@ DEFAULT_DRYRUN = True
 # or interleaves the pieces, so these pages use the rebuilt PDF lines.
 DEFAULT_FRAGMENTED_WORD_SHARE = .6
 DEFAULT_FRAGMENTED_MIN_LINES = 60
-EXTRACTION_VERSION = 8
+# Text on either side of an uncertain boundary shown to the layout reviewer.
+DEFAULT_REVIEW_CONTEXT_CHARS = 220
+DEFAULT_REVIEW_KEY_CHARS = 60
+# An unconfident reference this much longer than its list's median may
+# contain several entries.
+DEFAULT_REVIEW_SPLIT_RATIO = 1.6
+DEFAULT_REVIEW_MAX_CANDIDATES = 160
+EXTRACTION_VERSION = 9
 
 # PyMuPDF does not support concurrent use from different threads, including
 # calls operating on separate documents. Every public entry point shares this
@@ -63,6 +70,22 @@ _PUBLISHER_NAVIGATION = re.compile(r"^(?:check\s+for\b|article\s*$|open\s+access
 _MATH = re.compile(r"[=∑∏∫√±∂∇≈≠≤≥∞∈∉⊂⊆⊕⊗∀∃→↦×÷α-ωΑ-Ω]")
 _EQUATION_NUMBER = re.compile(r"\(\s*[A-Z]?\d{1,3}[a-z]?\s*\)")
 _LIST_MARKER = re.compile(r"^(?:\[\d{1,3}\]|\d{1,3}[.)]|[•▪◦●■∙·*]|[-–—])\s+")
+# Compared without spaces, as letter-spaced small capitals ("RE FERENCES")
+# arrive with spaces inside the word.
+_REFERENCES_HEADING = re.compile(
+    r"(?:\d+(?:\.\d+)*\.?)?(?:references(?:andnotes)?|bibliography|literaturecited|workscited|参考文献)[:：.]?", re.I)
+# Back matter that follows a reference list, often as a run-in heading.
+_BACK_MATTER = re.compile(
+    r"^(?:acknowledg(?:e)?ments?|funding|author contributions|competing interests|conflicts? of interest|"
+    r"data availability|code availability|supplementary (?:materials?|information)|additional information|"
+    r"publisher[’']?s note|declarations?|ethics (?:approval|statement|declarations?))\b", re.I)
+# Evidence that a block is part of a citation rather than appendix prose.
+_CITATION_EVIDENCE = re.compile(
+    r"\b(?:1[89]|20)\d{2}[a-z]?\b|arxiv|doi|https?://|\bet al\b|\bproc\b|journal|conference|\bvol\b|\bpp\b|press|preprint", re.I)
+# "[12]", "12." or a bare "12" opening a reference entry.
+_REFERENCE_NUMBER = re.compile(r"^\s*(?:\[(?P<bracket>\d{1,4})\]|(?P<dot>\d{1,4})\.(?=\s|[A-Z])|(?P<bare>\d{1,4})\s+(?=[A-Z]))")
+# An author-year entry opens with a surname followed by initials or a name.
+_AUTHOR_START = re.compile(r"^[A-Z][\w'’\-]+(?:\s+(?:de|van|von|der|da|del|di|le|la)\b)*,?\s+(?:[A-Z]\.|[A-Z]{1,3}\b|[A-Z][a-z]+)")
 _ITEM_START = re.compile(r"^(?:\[\d+\]\s*|\((?:\d+|[A-Za-z]|[ivxlcdmIVXLCDM]+)\)\s+|(?:\d+|[A-Za-z]|[ivxlcdmIVXLCDM]+)[.)](?:\s+|$)|[•▪◦*]\s*|[-–—]\s+)")
 # Trailing citation markers, footnote symbols and closing quotes may follow
 # the punctuation that actually ends a sentence or a heading.
@@ -106,6 +129,8 @@ def _open_pdf(pdf_bytes: bytes) -> fitz.Document:
 def _clean_text(text: str) -> str:
     text = unicodedata.normalize("NFC", text.translate(_LIGATURES))
     text = "".join(ch for ch in text if ch in "\n\t" or unicodedata.category(ch) != "Cc")
+    # Zero-width spaces separate list numbers from their text in some PDFs.
+    text = re.sub("[\u200b-\u200d\u2060\ufeff]", "", text)
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
@@ -291,7 +316,7 @@ def _rebuild_lines(fragments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for item in items[1:]:
             gap = item["bbox"][0] - segment[-1]["bbox"][2]
             # A bullet or item number is followed by a recurring gap as well.
-            marker = len(segment) == 1 and bool(_LIST_MARKER.match(segment[0]["text"] + " "))
+            marker = len(segment) == 1 and bool(_LIST_MARKER.fullmatch(segment[0]["text"] + " "))
             if gap > row["limit"] and not marker and (gap > row["limit"] * 4 or (index, segment[-1]["bbox"][2]) in recurring):
                 lines.append(_join_fragments(segment))
                 segment = []
@@ -867,6 +892,324 @@ def _sentence_split(previous: dict[str, Any], current: dict[str, Any], columns: 
             and gap <= size * .6 and _looks_like_heading(previous["text"] + " " + current["text"]))
 
 
+def _ends_references(text: str) -> bool:
+    """Whether a heading opens a section after a reference list, such as "1 Methods"."""
+    number = _SECTION.match(text)
+    return bool(_NAMED_SECTION.match(text[number.end():] if number else text)) or _appendix_heading(text, "heading")
+
+
+def _references_heading(text: str) -> bool:
+    return bool(_REFERENCES_HEADING.fullmatch(re.sub(r"\s+", "", text)))
+
+
+def _reference_marker(text: str) -> tuple[str, int] | None:
+    match = _REFERENCE_NUMBER.match(text)
+    if not match:
+        return None
+    kind = next(key for key in ("bracket", "dot", "bare") if match.group(key))
+    return kind, int(match.group(kind))
+
+
+def _appendix_heading(text: str, kind: str) -> bool:
+    """An appendix title, such as "A Proofs" or the small capitals "B DATASETS"."""
+    text = text.strip()
+    if len(text) > 90 or re.search(r"[.,;:]$", text):
+        return False
+    if re.match(r"(?:appendix|supplementary (?:materials?|information|methods))\b", text, re.I):
+        return True
+    # A converter can separate the number of "A.2 IMPLEMENTATION" from its title.
+    if re.fullmatch(r"[A-H](?:\.\d{1,2})+\.?", text):
+        return True
+    match = re.match(r"[A-H](?:\.\d{1,2})*\.?\s+(?=[A-Z])", text)
+    if not match or "," in text[:30]:
+        return False
+    letters = re.findall(r"[A-Za-z]", text[match.end():])
+    return kind == "heading" or sum(letter.isupper() for letter in letters) >= len(letters) * .7
+
+
+def _reference_regions(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Find each reference list and the blocks it consists of.
+
+    A list runs from its heading to the next section: a larger heading or
+    body text, a named section, an appendix, a short heading without an entry
+    number, or several text blocks in a row without any citation evidence.
+    Captions, graphics and smaller page furniture inside it are skipped.
+    """
+    sequence = [(page, block) for page in pages for block in page["blocks"]]
+    regions: list[dict[str, Any]] = []
+    index = 0
+    while index < len(sequence):
+        page, heading = sequence[index]
+        index += 1
+        if len(heading["text"]) > 40 or not _references_heading(heading["text"]):
+            continue
+        following = [block for _, block in sequence[index:index + 12]
+                     if block["type"] in {"paragraph", "heading"} and block.get("geometry_matched") is not False]
+        if not following:
+            continue
+        size = median(float(block["font_size"]) for block in following[:8])
+        members: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        end = None
+        while index < len(sequence):
+            candidate_page, block = sequence[index]
+            text, kind = block["text"].strip(), block["type"]
+            same = abs(float(block["font_size"]) - size) <= max(.6, size * .08)
+            bbox = block.get("bbox") or [0, 0, 0, 0]
+            if len(text) < 80 and (bbox[3] < candidate_page["height"] * .08 or bbox[1] > candidate_page["height"] * .9):
+                # Running headers and folios neither end nor belong to a list.
+                index += 1
+                continue
+
+            def prose(item: dict[str, Any]) -> bool:
+                # Author lists and titles of an entry split into lines lack a
+                # year as well, but prose is mostly lower-case words.
+                value = item["text"].strip()
+                words = re.findall(r"[A-Za-z]+", value)
+                return (len(value) >= 40 and not _CITATION_EVIDENCE.search(value) and not _reference_marker(value)
+                        and sum(word.islower() for word in words) >= len(words) * .65)
+
+            ahead = [item for _, item in sequence[index:index + 10]
+                     if item["type"] in {"paragraph", "heading"} and not re.fullmatch(r"\[?\d{1,4}[.\]]?", item["text"].strip())
+                     and abs(float(item["font_size"]) - size) <= max(.6, size * .08)][:4]
+            if (_references_heading(text) or _BACK_MATTER.match(text) or _appendix_heading(text, kind)
+                    or (same and kind in {"paragraph", "heading"} and len(ahead) == 4 and all(map(prose, ahead)))
+                    or (kind == "heading" and (_NAMED_SECTION.match(text) or not same
+                                               or (len(text) < 60 and not _reference_marker(text) and "," not in text)))
+                    or (not same and float(block["font_size"]) > size and len(text) > 200)):
+                end = (candidate_page, block)
+                break
+            index += 1
+            # Converter text without PDF lines (rotated stamps) cannot be rebuilt.
+            if (same and kind not in {"caption", "table"} and not block.get("display_math")
+                    and block.get("translation_scope", "body") == "body" and block.get("geometry_matched") is not False):
+                members.append((candidate_page, block))
+        if members:
+            regions.append({"size": size, "start": (page, heading), "end": end, "members": members})
+    return regions
+
+
+def _reads_after(rect: list[float] | tuple, anchor: list[float], columns: bool, inclusive: bool = False) -> bool:
+    """Whether text follows an anchor block in reading order, or belongs to it.
+
+    On a multi-column page, a column left of the anchor precedes it and one
+    to its right follows it. On a single-column page only height counts, so a
+    run-in line beside a short heading is not mistaken for another column.
+    """
+    if columns and rect[2] < anchor[0]:
+        return False
+    if columns and rect[0] > anchor[2]:
+        return True
+    return (rect[1] + rect[3]) / 2 > (anchor[1] if inclusive else anchor[3] - 1)
+
+
+def _reference_rows(page: dict[str, Any], region: dict[str, Any],
+                    figures: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    """Rebuild one page of a reference list from its PDF lines by column.
+
+    Converters separate hanging entry numbers from their text, and justified
+    narrow columns from each other. Joining lines by baseline restores both.
+    """
+    size = region["size"]
+    (start_page, start), end = region["start"], region["end"]
+    # Captions, tables and formulas can share the list's type size. Their
+    # blocks are excluded; converter alignment is too unreliable to include
+    # only the lines of the list's own blocks.
+    blocked = [fitz.Rect(figure["bbox"]) for figure in figures if figure["page"] == page["number"]]
+    blocked += [fitz.Rect(block["bbox"]) + (-1, -1, 1, 1) for block in page["blocks"]
+                if (block["type"] in {"caption", "table", "equation"} or block.get("translation_scope") in {"caption", "figure_content"})
+                and block.get("geometry_matched") is not False
+                and fitz.Rect(block["bbox"]).get_area() < page["width"] * page["height"] * .5]
+    candidates = [line for group in page["groups"] for line in group
+                  if abs(line["size"] - size) <= max(.6, size * .08)
+                  and not any(area.contains(fitz.Rect(line["bbox"])) for area in blocked)]
+    # Lines of a single-column list mostly span more than half of the page.
+    columns = sum(line["bbox"][2] - line["bbox"][0] > page["width"] * .55 for line in candidates) < len(candidates) * .3
+    lines = []
+    for line in candidates:
+        rect = line["bbox"]
+        if page["number"] == start_page["number"] and not _reads_after(rect, start["bbox"], columns):
+            continue
+        if end and page["number"] == end[0]["number"] and _reads_after(rect, end[1]["bbox"], columns, inclusive=True):
+            continue
+        lines.append(line)
+    if not lines:
+        return []
+    # A hanging number is now part of its entry; a number alone is a folio.
+    rows = [row for row in _rebuild_lines(lines) if not _PAGE_MARKER.fullmatch(row["text"])]
+    if not rows:
+        return []
+    # Columns are separated by gutters no line crosses. A single-column list
+    # has lines wider than half the page, which then join every interval.
+    narrow = [row for row in rows if row["bbox"][2] - row["bbox"][0] < page["width"] * .45]
+    basis = narrow if len(narrow) >= len(rows) * .7 else rows
+    columns: list[list[float]] = []
+    for x0, x1 in sorted((row["bbox"][0], row["bbox"][2]) for row in basis):
+        if columns and x0 <= columns[-1][1] + size * .8:
+            columns[-1][1] = max(columns[-1][1], x1)
+        else:
+            columns.append([x0, x1])
+
+    def column(row: dict[str, Any]) -> int:
+        middle = (row["bbox"][0] + row["bbox"][2]) / 2
+        inside = [index for index, (x0, x1) in enumerate(columns) if x0 - size <= row["bbox"][0] <= x1]
+        return inside[0] if inside else min(range(len(columns)), key=lambda index: abs(sum(columns[index]) / 2 - middle))
+
+    return sorted(((column(row), row) for row in rows), key=lambda item: (item[0], item[1]["bbox"][1], item[1]["bbox"][0]))
+
+
+def _segment_references(rows: list[tuple[int, int, dict[str, Any]]], size: float) -> list[dict[str, Any]]:
+    """Split ordered reference lines into entries.
+
+    Numbered lists follow their sequence, so a page number or a wrapped
+    "2020" never starts an entry. Author-year lists use their hanging indent,
+    or the gap and short final line that end an entry.
+    """
+    markers = [_reference_marker(row["text"]) for _, _, row in rows]
+    kinds = Counter(marker[0] for marker in markers if marker)
+    kind = kinds.most_common(1)[0][0] if kinds else None
+    values = [marker[1] for marker in markers if marker and marker[0] == kind]
+    steps = sum(1 for a, b in zip(values, values[1:]) if b == a + 1)
+    numbered = kind is not None and steps >= 2 and steps >= (len(values) - 1) * .5
+    lefts: dict[tuple[int, int], float] = {}
+    rights: dict[tuple[int, int], float] = {}
+    for page, column, row in rows:
+        key = (page, column)
+        lefts[key] = min(lefts.get(key, row["bbox"][0]), row["bbox"][0])
+        rights[key] = max(rights.get(key, row["bbox"][2]), row["bbox"][2])
+    indented = sum(row["bbox"][0] > lefts[(page, column)] + size * .8 for page, column, row in rows)
+    hanging = indented >= len(rows) * .2
+    gaps = [row["bbox"][1] - previous["bbox"][3]
+            for (page, column, previous), (page_b, column_b, row) in zip(rows, rows[1:])
+            if (page, column) == (page_b, column_b)]
+    typical_gap = median(gaps) if gaps else 0
+    entries: list[dict[str, Any]] = []
+    expected = None
+    for index, (page, column, row) in enumerate(rows):
+        marker = markers[index]
+        previous = rows[index - 1] if index else None
+        if numbered:
+            start = bool(marker and marker[0] == kind and (expected is None or expected <= marker[1] <= expected + 3))
+        elif hanging:
+            start = row["bbox"][0] <= lefts[(page, column)] + size * .4
+        else:
+            short = previous is not None and previous[2]["bbox"][2] < rights[(previous[0], previous[1])] - size * 2
+            ended = previous is not None and bool(re.search(r"[.)\]]\s*$", previous[2]["text"]))
+            spaced = (previous is not None and (previous[0], previous[1]) == (page, column)
+                      and row["bbox"][1] - previous[2]["bbox"][3] > typical_gap + size * .35)
+            start = spaced or (short and ended and bool(_AUTHOR_START.match(row["text"])))
+        if start or not entries:
+            if numbered and marker and marker[0] == kind:
+                expected = marker[1] + 1
+            entries.append({"type": "reference", "rows": [],
+                            "number": marker[1] if numbered and marker and marker[0] == kind else None,
+                            "confident": numbered or hanging})
+        entries[-1]["rows"].append((page, column, row))
+    for entry in entries:
+        entry["text"] = _join_lines([row for _, _, row in entry["rows"]])
+    if numbered:
+        entries = _split_skipped_numbers(entries, kind)
+    return entries
+
+
+def _split_skipped_numbers(entries: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    """Recover entries whose number does not open a line of its own."""
+    result: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        following = next((item["number"] for item in entries[index + 1:] if item["number"] is not None), None)
+        pieces = [entry]
+        if entry["number"] is not None and following is not None and following > entry["number"] + 1:
+            text, parts, number = entry["text"], [], entry["number"] + 1
+            while number < following:
+                pattern = {"bracket": rf"\s\[{number}\]\s*", "dot": rf"\s{number}\.\s+(?=[A-Z])",
+                           "bare": rf"\s{number}\s+(?=[A-Z])"}[kind]
+                match = re.search(pattern, text)
+                if not match:
+                    break
+                parts.append((text[:match.start()].strip(), number - 1))
+                text = text[match.start():].strip()
+                number += 1
+            if parts:
+                pieces = [dict(entry, text=part, number=value) for part, value in parts]
+                pieces.append(dict(entry, text=text, number=number - 1))
+            # A number that is still missing leaves this boundary open.
+            if number < following:
+                pieces[-1]["confident"] = False
+        result.extend(pieces)
+    return result
+
+
+def _back_matter_row(row: dict[str, Any]) -> bool:
+    """Whether a line opens acknowledgements or similar sections."""
+    match = _BACK_MATTER.match(row["text"])
+    return bool(match) and (match.group(0).isupper() or row["bold"]
+                            or bool(re.match(r"\s*[:.]", row["text"][match.end():])))
+
+
+def _rebuild_references(pages: list[dict[str, Any]], figures: list[dict[str, Any]]) -> None:
+    """Replace reference list blocks with one ``reference`` block per entry.
+
+    An entry keeps the region where it starts; parts in another column or on
+    the next page are listed in ``source_fragments``, as for merged prose.
+    """
+    by_number = {page["number"]: page for page in pages}
+    for region in _reference_regions(pages):
+        member_pages = sorted({page["number"] for page, _ in region["members"]})
+        rows = [(number, column, row) for number in member_pages
+                for column, row in _reference_rows(by_number[number], region, figures)]
+        stop = next((index for index, (_, _, row) in enumerate(rows) if _back_matter_row(row)), len(rows))
+        entries = _segment_references(rows[:stop], region["size"])
+        # Back matter set in the list's type size can follow the last entry
+        # within the same block; it stays prose, one paragraph per column.
+        for number, column, row in rows[stop:]:
+            if (not entries or entries[-1]["type"] != "paragraph" or _back_matter_row(row)
+                    or entries[-1]["rows"][-1][:2] != (number, column)):
+                entries.append({"type": "paragraph", "rows": [], "number": None, "confident": True})
+            entries[-1]["rows"].append((number, column, row))
+        if not entries:
+            continue
+        removed = {id(block) for _, block in region["members"]}
+        placed: dict[int, list[dict[str, Any]]] = {}
+        for entry in entries:
+            fragments: list[dict[str, Any]] = []
+            for number, column, row in entry["rows"]:
+                if fragments and (fragments[-1]["page"], fragments[-1]["column"]) == (number, column):
+                    fragments[-1]["rect"] |= fitz.Rect(row["bbox"])
+                    fragments[-1]["lines"].append(row)
+                else:
+                    fragments.append({"page": number, "column": column, "rect": fitz.Rect(row["bbox"]), "lines": [row]})
+            first = fragments[0]
+            block = {"page": first["page"], "type": entry["type"],
+                     "text": entry.get("text") or _join_lines([row for _, _, row in entry["rows"]]),
+                     "bbox": _bbox(first["rect"]),
+                     "first_line_bbox": _bbox(first["lines"][0]["bbox"]), "last_line_bbox": _bbox(first["lines"][-1]["bbox"]),
+                     "font_size": round(region["size"], 2), "text_source": "pdf", "geometry_matched": True,
+                     "translation_scope": "body"}
+            if entry["type"] == "reference":
+                block["reference_confident"] = entry["confident"]
+            if entry["number"] is not None:
+                block["reference_number"] = entry["number"]
+            if len(fragments) > 1:
+                block["source_fragments"] = [{"page": fragment["page"], "bbox": _bbox(fragment["rect"]),
+                                              "text": _join_lines(fragment["lines"])} for fragment in fragments]
+            placed.setdefault(first["page"], []).append(block)
+        start_page, start = region["start"]
+        for number in sorted(set(member_pages) | set(placed)):
+            page = by_number[number]
+            positions = [index for index, block in enumerate(page["blocks"]) if id(block) in removed]
+            if positions:
+                at = positions[0]
+            elif number == start_page["number"]:
+                at = next(index for index, block in enumerate(page["blocks"]) if block is start) + 1
+            else:
+                at = 0
+            kept = [block for block in page["blocks"] if id(block) not in removed]
+            references = placed.get(number, [])
+            offset = sum(1 for block in kept if block["id"].startswith(f"p{number}-r"))
+            for index, block in enumerate(references, offset + 1):
+                block["id"] = f"p{number}-r{index}"
+            page["blocks"] = kept[:at] + references + kept[at:]
+
+
 def _prose_continues(previous: dict[str, Any], current: dict[str, Any],
                      page: dict[str, Any], column_starts: list[float]) -> bool:
     """Recognize a wrapped prose line without treating an empty line as proof."""
@@ -934,9 +1277,9 @@ def _merge_prose_continuations(document: dict[str, Any]) -> None:
         for block in blocks:
             text = block.get("text", "").strip()
             if block.get("type") == "heading":
-                if re.fullmatch(r"(?:\d+(?:\.\d+)*\.?\s+)?(?:references|bibliography|参考文献)\s*[:：.]?", text, re.I):
+                if _references_heading(text):
                     in_references = True
-                elif _NAMED_SECTION.match(text):
+                elif _ends_references(text):
                     in_references = False
             # A paragraph can begin with an inline section title. Retaining
             # its ID lets its continuation join without moving the TOC anchor.
@@ -1033,6 +1376,7 @@ def annotate_paragraph_groups(document: dict[str, Any]) -> None:
                   for group in document.get("paragraph_groups", [])}
     protected = {item.get("block_id") for item in document.get("toc", [])}
     metadata = {document.get("title"), document.get("authors")}
+    forced = {tuple(pair) for pair in document.get("layout_links", [])}
     pages = {page["number"]: page for page in document.get("pages", [])}
     starts = {number: [block["bbox"][0] for block in page.get("blocks", [])
                        if block.get("type") == "paragraph" and block.get("translation_scope") == "body"
@@ -1058,9 +1402,9 @@ def annotate_paragraph_groups(document: dict[str, Any]) -> None:
         for block in page.get("blocks", []):
             text = block.get("text", "").strip()
             if block.get("type") == "heading":
-                if re.fullmatch(r"(?:\d+(?:\.\d+)*\.?\s+)?(?:references|bibliography|参考文献)\s*[:：.]?", text, re.I):
+                if _references_heading(text):
                     in_references = True
-                elif _NAMED_SECTION.match(text):
+                elif _ends_references(text):
                     in_references = False
                 # A converter can repeat a running header at the end of a
                 # page. Its physical top margin cannot separate bottom prose.
@@ -1108,6 +1452,8 @@ def annotate_paragraph_groups(document: dict[str, Any]) -> None:
                                                      float(previous.get("font_size", 0))))
                       and block["bbox"][0] <= min(starts[page["number"]], default=block["bbox"][0]) + float(block.get("font_size", 0)) * 2):
                     match = True
+            # A continuation confirmed by the AI layout review.
+            match = match or bool(previous and (previous["id"], block["id"]) in forced)
             if match:
                 group_id = previous.get("paragraph_id", previous["id"])
                 members = groups.setdefault(group_id, [previous])
@@ -1126,6 +1472,165 @@ def annotate_paragraph_groups(document: dict[str, Any]) -> None:
             group["text_zh"] = cached["text_zh"]
         result.append(group)
     document["paragraph_groups"] = result
+
+
+def _review_anchor(block: dict[str, Any], page: int, end: str) -> dict[str, Any]:
+    """Identify a block by page and text, as IDs change on re-extraction."""
+    key = _alignment_key(block["text"])
+    return {"page": page, end: key[-DEFAULT_REVIEW_KEY_CHARS:] if end == "tail" else key[:DEFAULT_REVIEW_KEY_CHARS]}
+
+
+def _review_signature(candidate: dict[str, Any]) -> str:
+    anchors = [candidate.get(name) for name in ("before", "after", "block")]
+    return "|".join(f"{anchor['page']}:{anchor.get('tail', '')}:{anchor.get('head', '')}" for anchor in anchors if anchor)
+
+
+def layout_review_candidates(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """List the boundaries and reference entries that local rules leave open.
+
+    A prose boundary qualifies when the left side does not end a sentence;
+    reference boundaries and long entries qualify only in lists whose entries
+    could not be separated by numbering or a hanging indent. Candidates that
+    an earlier review already decided are omitted.
+    """
+    reviewed = set(document.get("layout_review", {}).get("reviewed", []))
+    protected = {item.get("block_id") for item in document.get("toc", [])}
+    protected.update(figure.get("caption_block_id") for figure in document.get("figures", []))
+    metadata = {document.get("title"), document.get("authors")}
+    candidates: list[dict[str, Any]] = []
+
+    def excerpt(text: str, tail: bool) -> str:
+        text = " ".join(text.split())
+        return text[-DEFAULT_REVIEW_CONTEXT_CHARS:] if tail else text[:DEFAULT_REVIEW_CONTEXT_CHARS]
+
+    previous = None
+    for page in document.get("pages", []):
+        for block in page.get("blocks", []):
+            text = block.get("text", "").strip()
+            kind, scope = block.get("type"), block.get("translation_scope", "body")
+            if scope in {"caption", "figure_content"} or kind in {"caption", "table"}:
+                continue
+            if kind not in {"paragraph", "reference"} or block.get("geometry_matched") is False or text in metadata:
+                previous = None
+                continue
+            pair = previous
+            previous = (page["number"], block)
+            if pair is None or block.get("id") in protected:
+                continue
+            before_page, before = pair
+            if (before["type"] != kind or page["number"] - before_page > 1
+                    or block.get("continuation_of") == before.get("id")):
+                continue
+            left = before["text"].rstrip()
+            if kind == "paragraph":
+                if (len(left) < 20 or len(text) < 20 or (_SENTENCE_END.search(left) and not _OPEN_END.search(left))
+                        or _ITEM_START.match(text) or _CAPTION.match(text) or _NAMED_SECTION.match(text)):
+                    continue
+            elif (block.get("reference_confident", True) or _reference_marker(text)
+                  or (_AUTHOR_START.match(text) and _SENTENCE_END.search(left))):
+                continue
+            candidates.append({"kind": "join", "type": kind,
+                               "before": _review_anchor(before, before_page, "tail"),
+                               "after": _review_anchor(block, page["number"], "head"),
+                               "before_text": excerpt(left, True), "after_text": excerpt(text, False)})
+    references = [(page["number"], block) for page in document.get("pages", []) for block in page.get("blocks", [])
+                  if block.get("type") == "reference"]
+    typical = median(len(block["text"]) for _, block in references) if references else 0
+    for number, block in references:
+        if not block.get("reference_confident", True) and len(block["text"]) >= max(250, typical * DEFAULT_REVIEW_SPLIT_RATIO):
+            candidates.append({"kind": "split", "type": "reference", "block": _review_anchor(block, number, "head"),
+                               "text": block["text"][:DEFAULT_REVIEW_CONTEXT_CHARS * 8]})
+    fresh = [candidate for candidate in candidates if _review_signature(candidate) not in reviewed]
+    for index, candidate in enumerate(fresh[:DEFAULT_REVIEW_MAX_CANDIDATES], 1):
+        candidate["id"] = f"{candidate['kind'][0]}{index}"
+        candidate["signature"] = _review_signature(candidate)
+    return fresh[:DEFAULT_REVIEW_MAX_CANDIDATES]
+
+
+def _find_review_block(document: dict[str, Any], anchor: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    for page in document.get("pages", []):
+        if page["number"] != anchor.get("page"):
+            continue
+        for block in page.get("blocks", []):
+            key = _alignment_key(block.get("text", ""))
+            if (("head" in anchor and anchor["head"] and key.startswith(anchor["head"]))
+                    or ("tail" in anchor and anchor["tail"] and key.endswith(anchor["tail"]))):
+                return page, block
+    return None
+
+
+def _split_reference_text(text: str, starts: list[str]) -> list[str]:
+    """Split before each verbatim entry opening, in order, at word starts."""
+    pieces, position = [], 0
+    normalized = " ".join(text.split())
+    for start in starts:
+        start = " ".join(str(start).split())
+        if len(start) < 8:
+            continue
+        found = normalized.find(start, position + 1)
+        if found <= 0 or normalized[found - 1] != " ":
+            continue
+        pieces.append(normalized[position:found].strip())
+        position = found
+    pieces.append(normalized[position:].strip())
+    return [piece for piece in pieces if piece]
+
+
+def apply_layout_review(document: dict[str, Any], decisions: list[dict[str, Any]]) -> bool:
+    """Apply accepted review decisions; return whether the layout changed.
+
+    Joins on one page, and reference entries across pages, become one block
+    whose other regions are kept in ``source_fragments``. Prose continuing
+    on the next page is only linked, so each page keeps its own text.
+    """
+    changed = False
+    links = [list(pair) for pair in document.get("layout_links", [])]
+    for decision in decisions:
+        if decision.get("kind") == "split":
+            found = _find_review_block(document, decision.get("block", {}))
+            if not found or found[1].get("type") != "reference":
+                continue
+            page, block = found
+            pieces = _split_reference_text(block["text"], decision.get("starts", []))
+            if len(pieces) < 2:
+                continue
+            index = page["blocks"].index(block)
+            replacement = []
+            for number, piece in enumerate(pieces):
+                item = dict(block, text=piece, reference_confident=True)
+                item.pop("text_zh", None)
+                item.pop("reference_number", None)
+                if number:
+                    item["id"] = f"{block['id']}-{number}"
+                    item.pop("source_fragments", None)
+                replacement.append(item)
+            page["blocks"][index:index + 1] = replacement
+            changed = True
+            continue
+        before, after = (_find_review_block(document, decision.get(name, {})) for name in ("before", "after"))
+        if not before or not after or before[1] is after[1] or before[1].get("type") != after[1].get("type"):
+            continue
+        (before_page, first), (after_page, second) = before, after
+        if first.get("type") == "paragraph" and before_page is not after_page:
+            if [first["id"], second["id"]] not in links:
+                links.append([first["id"], second["id"]])
+                document["layout_links"] = links
+                changed = True
+            continue
+
+        def fragments(block: dict[str, Any], page: dict[str, Any]) -> list[dict[str, Any]]:
+            return block.get("source_fragments") or [{"page": page["number"], "bbox": block.get("bbox"), "text": block["text"]}]
+
+        first["source_fragments"] = fragments(first, before_page) + fragments(second, after_page)
+        first["text"] = _join_lines([{"text": first["text"]}, {"text": second["text"]}])
+        if before_page is after_page:
+            first["last_line_bbox"] = second.get("last_line_bbox")
+        first.pop("text_zh", None)
+        after_page["blocks"].remove(second)
+        changed = True
+    if changed:
+        annotate_paragraph_groups(document)
+    return changed
 
 
 def _metadata(pages: list[dict[str, Any]], pdf_metadata: dict[str, Any]) -> tuple[str, str, str, set[str]]:
@@ -1709,6 +2214,7 @@ def extract_document(pdf_bytes: bytes, progress: Callable[[int], Any] | None = N
         # Headings feed the title and the TOC, so restore them first.
         for page in raw_pages:
             _rejoin_split_sentences(page)
+        _rebuild_references(raw_pages, figures)
         title, authors, abstract, title_ids = _metadata(raw_pages, document.metadata or {})
         if progress:
             progress(72)

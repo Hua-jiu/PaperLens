@@ -25,6 +25,8 @@ DEFAULT_REFLOW_BATCH_CHARS = 20_000
 DEFAULT_REFLOW_BATCH_BLOCKS = 80
 DEFAULT_REFLOW_RECOVERY_REQUESTS = 6
 DEFAULT_REFLOW_EXCERPT_CHARS = 360
+DEFAULT_REVIEW_BATCH_ITEMS = 40
+DEFAULT_REVIEW_BATCH_CHARS = 16_000
 DEFAULT_HISTORY_MESSAGES = 16
 DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 DEFAULT_SINGLE_TEXT_CHARS = 40_000
@@ -808,7 +810,8 @@ class AIService:
         current: list[dict[str, Any]] = []
         characters = 0
         for block in blocks:
-            if block.get("paragraph_id") not in (None, ""):
+            # Reference entries are already ordered by their list.
+            if block.get("paragraph_id") not in (None, "") or block.get("type") == "reference":
                 if current:
                     batches.append(current)
                     current, characters = [], 0
@@ -835,6 +838,76 @@ class AIService:
         for batch in batches:
             reordered.extend(self._reflow_batch_recover(batch, recovery_budget))
         return reordered
+
+    def review_layout(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        """Judge boundaries and reference entries that local rules leave open.
+
+        Returns the accepted join IDs, the verbatim openings of further
+        entries per split candidate, and the IDs that received an answer. A
+        batch whose answer stays invalid after one retry is left undecided.
+        """
+        self.review_warnings = []
+        result: dict[str, Any] = {"join": set(), "split": {}, "decided": set()}
+        batches: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        characters = 0
+        for candidate in candidates:
+            length = sum(len(candidate.get(key, "")) for key in ("before_text", "after_text", "text"))
+            if current and (len(current) >= DEFAULT_REVIEW_BATCH_ITEMS or characters + length > DEFAULT_REVIEW_BATCH_CHARS):
+                batches.append(current)
+                current, characters = [], 0
+            current.append(candidate)
+            characters += length
+        if current:
+            batches.append(current)
+        for batch in batches:
+            for attempt in range(2):
+                try:
+                    joins, splits = self._review_batch_once(batch)
+                except ModelResponseError as exc:
+                    if attempt:
+                        self.review_warnings.append(f"有 {len(batch)} 处段落或参考文献边界未完成 AI 校对：{exc}")
+                    continue
+                result["join"].update(joins)
+                result["split"].update(splits)
+                result["decided"].update(candidate["id"] for candidate in batch)
+                break
+        return result
+
+    def _review_batch_once(self, batch: list[dict[str, Any]]) -> tuple[set[str], dict[str, list[str]]]:
+        boundaries = [{"id": item["id"], "type": item["type"], "before": item["before_text"], "after": item["after_text"]}
+                      for item in batch if item["kind"] == "join"]
+        entries = [{"id": item["id"], "text": item["text"]} for item in batch if item["kind"] == "split"]
+        reply = self._complete(
+            "reflow",
+            "你是 PDF 学术论文版面校对器。以下位置本地规则无法确定，请依据语义判断。"
+            "boundaries 每项给出分界前文本的结尾 before 与分界后文本的开头 after。"
+            "type 为 paragraph 时，若两侧明显是同一句话或同一段落，只是被换栏、换页、图表或版面误判打断，判为合并；"
+            "新段落、标题、列表项、图注或无关内容不合并。"
+            "type 为 reference 时，若 after 是同一条参考文献的后续部分而不是新的一条文献，判为合并。"
+            "entries 每项是一段可能包含多条参考文献的文本：若含有多条，按顺序给出第二条及之后每条文献开头的原文片段"
+            "（逐字复制约 6 至 12 个词，必须能在 text 中原样找到）；只有一条时给空列表。"
+            "无法确定时不合并、不拆分。不改写、不翻译原文。"
+            '仅返回 JSON：{"join":["应合并的 boundary id"],"split":{"entry id":["后续文献开头的原文片段"]}}。',
+            json.dumps({"boundaries": boundaries, "entries": entries}, ensure_ascii=False),
+        )
+        parsed = _strict_json(reply)
+        if not isinstance(parsed, dict):
+            raise ModelResponseError("AI 版面校对响应不是 JSON 对象。")
+        joins, splits = parsed.get("join", []), parsed.get("split", {})
+        boundary_ids = {item["id"] for item in boundaries}
+        entry_ids = {item["id"] for item in entries}
+        if not isinstance(joins, list) or not isinstance(splits, dict):
+            raise ModelResponseError("AI 版面校对响应缺少 join 列表或 split 对象。")
+        if any(not isinstance(identifier, str) or identifier not in boundary_ids for identifier in joins):
+            raise ModelResponseError("AI 版面校对返回了未知的边界 id。")
+        accepted: dict[str, list[str]] = {}
+        for identifier, starts in splits.items():
+            if identifier not in entry_ids or not isinstance(starts, list) or any(not isinstance(start, str) for start in starts):
+                raise ModelResponseError("AI 版面校对返回了无效的参考文献拆分。")
+            if starts:
+                accepted[identifier] = starts
+        return set(joins), accepted
 
     def _preserve_reflow_batch(self, batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
         page = _page_number(batch[0])

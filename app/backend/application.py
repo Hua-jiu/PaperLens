@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
@@ -10,7 +11,8 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .ai_service import AIService, ConfigurationError, ModelResponseError
-from .pdf_engine import EXTRACTION_VERSION, annotate_translation_scopes, extract_document
+from .pdf_engine import (EXTRACTION_VERSION, annotate_translation_scopes, apply_layout_review, extract_document,
+                         layout_review_candidates)
 from .storage import DEFAULT_MODULES, Store, timestamp
 
 MAX_UPLOAD_BYTES = 60 * 1024 * 1024
@@ -319,6 +321,12 @@ class Application:
                 failures.append(safe_error(exc))
         if self.module_configured("reflow"):
             try:
+                self.update_paper(paper_id, stage="AI 校对段落与参考文献")
+                self.review_layout(paper_id, service)
+                failures.extend(service.review_warnings)
+            except Exception as exc:
+                failures.append(safe_error(exc))
+            try:
                 self.update_paper(paper_id, stage="AI 优化段落与阅读顺序")
                 document = self.store.get(paper_id)["document"]
                 for page in document["pages"]:
@@ -350,6 +358,37 @@ class Application:
             except Exception as exc:
                 failures.append(safe_error(exc))
         self.update_paper(paper_id, ai_status="partial" if failures else "complete", stage="可阅读 · 部分 AI 任务失败" if failures else "准备就绪", ai_error="；".join(failures))
+
+    def review_layout(self, paper_id: str, service: AIService) -> None:
+        """Ask the model about uncertain boundaries and store its decisions.
+
+        Decisions identify blocks by page and text, so a later re-extraction
+        applies them again. Rejected candidates are remembered as reviewed.
+        """
+        service.review_warnings = []
+        candidates = layout_review_candidates(self.store.get(paper_id)["document"])
+        if not candidates:
+            return
+        review = service.review_layout(candidates)
+        decided = [candidate for candidate in candidates if candidate["id"] in review["decided"]]
+        accepted = []
+        for candidate in decided:
+            if candidate["kind"] == "join" and candidate["id"] in review["join"]:
+                accepted.append({"kind": "join", "before": candidate["before"], "after": candidate["after"]})
+            elif candidate["kind"] == "split" and candidate["id"] in review["split"]:
+                accepted.append({"kind": "split", "block": candidate["block"], "starts": review["split"][candidate["id"]]})
+
+        def save_review(record):
+            document = record["document"]
+            state = document.setdefault("layout_review", {"decisions": [], "reviewed": []})
+            state["reviewed"] = list(dict.fromkeys(state["reviewed"] + [candidate["signature"] for candidate in decided]))
+            state["decisions"].extend(accepted)
+            previous = copy.deepcopy(document)
+            if apply_layout_review(document, accepted):
+                remap_document_anchors(record, previous)
+                update_translation_state(record)
+
+        self.store.update(paper_id, save_review)
 
     @serialized_document
     def translate(self, paper_id: str) -> None:
@@ -541,6 +580,11 @@ class Application:
 
 def merge_extracted_document(current: dict, extracted: dict) -> dict:
     """Merge against the latest record, so concurrent notes or translations survive."""
+    review = current.get("layout_review")
+    if review:
+        # AI layout decisions name blocks by text and apply to the new layout.
+        extracted["layout_review"] = review
+        apply_layout_review(extracted, review.get("decisions", []))
     normalized = lambda text: " ".join(str(text or "").split())
     translations = {(page["number"], normalized(block.get("text"))): block.get("text_zh", "")
                     for page in current.get("pages", []) for block in page.get("blocks", []) if block.get("text_zh")}
@@ -745,8 +789,10 @@ def translation_targets(document: dict) -> list[dict]:
                 targets.append({"id": "para:" + group["id"], "text": group["text"],
                                 "translated": has_text(group.get("text_zh"))})
                 emitted.add(group["id"])
+        # Reference entries are read in their original language.
         elif (has_text(block.get("text")) and block["id"] not in associated
-              and block.get("translation_scope") != "figure_content" and block.get("type") not in visual_types):
+              and block.get("translation_scope") != "figure_content"
+              and block.get("type") not in visual_types | {"reference"}):
             targets.append({"id": block["id"], "text": block["text"],
                             "translated": has_text(block.get("text_zh"))})
     for figure in document.get("figures", []):

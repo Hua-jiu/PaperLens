@@ -21,7 +21,7 @@ const moduleInfo = {
   summary: { name: '论文总结', hint: '中文标题与概要', icon: 'sparkles' },
   translation: { name: '翻译', hint: '全文、目录、图注与划词', icon: 'translate' },
   chat: { name: 'AI 问答', hint: '论文问答与选段解释', icon: 'chat' },
-  reflow: { name: 'AI 重排', hint: '阅读顺序与段落结构', icon: 'layout' },
+  reflow: { name: 'AI 重排', hint: '阅读顺序、段落与参考文献校对', icon: 'layout' },
 };
 const paths = {
   book: '<path d="M12 6c-2-2-6-2-9-1v14c3-1 7-1 9 1 2-2 6-2 9-1V5c-3-1-7-1-9 1Z"/><path d="M12 6v14"/>',

@@ -46,6 +46,7 @@
 .block-caption .block-text.block-translation{font-size:calc(var(--reader-size)*.78);color:#a08aac;line-height:1.8}
 .block-equation .block-text.block-translation{text-align:center}
 .block-formula-image{text-align:center;margin:4px 0 20px;overflow-x:auto}.block-formula-image img{display:inline-block;max-width:100%;height:auto}
+.block-reference .block-text{font-size:calc(var(--reader-size)*.8);line-height:1.7;margin:0 0 9px;padding-left:1.8em;text-indent:-1.8em;text-align:left;color:#6f6378}
 .document-figure .figure-original,.document-figure .figure-translation{display:block}
 .document-figure .figure-translation{margin-top:8px}
 .reading-document [hidden]{display:none!important}
