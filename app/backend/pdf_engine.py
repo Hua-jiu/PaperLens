@@ -36,7 +36,7 @@ DEFAULT_DRYRUN = True
 # or interleaves the pieces, so these pages use the rebuilt PDF lines.
 DEFAULT_FRAGMENTED_WORD_SHARE = .6
 DEFAULT_FRAGMENTED_MIN_LINES = 60
-EXTRACTION_VERSION = 7
+EXTRACTION_VERSION = 8
 
 # PyMuPDF does not support concurrent use from different threads, including
 # calls operating on separate documents. Every public entry point shares this
@@ -63,6 +63,17 @@ _PUBLISHER_NAVIGATION = re.compile(r"^(?:check\s+for\b|article\s*$|open\s+access
 _MATH = re.compile(r"[=∑∏∫√±∂∇≈≠≤≥∞∈∉⊂⊆⊕⊗∀∃→↦×÷α-ωΑ-Ω]")
 _EQUATION_NUMBER = re.compile(r"\(\s*[A-Z]?\d{1,3}[a-z]?\s*\)")
 _LIST_MARKER = re.compile(r"^(?:\[\d{1,3}\]|\d{1,3}[.)]|[•▪◦●■∙·*]|[-–—])\s+")
+_ITEM_START = re.compile(r"^(?:\[\d+\]\s*|\((?:\d+|[A-Za-z]|[ivxlcdmIVXLCDM]+)\)\s+|(?:\d+|[A-Za-z]|[ivxlcdmIVXLCDM]+)[.)](?:\s+|$)|[•▪◦*]\s*|[-–—]\s+)")
+# Trailing citation markers, footnote symbols and closing quotes may follow
+# the punctuation that actually ends a sentence or a heading.
+_SENTENCE_END = re.compile(r"[.!?:;。！？：；][\s\d,\-–\[\]()\"'’”»*†‡]*$")
+# Words that cannot end an English sentence, and abbreviations whose full
+# stop does not end one either.
+_OPEN_END = re.compile(
+    r"(?:\b(?:a|an|the|of|to|in|on|for|with|and|or|nor|but|by|from|as|at|into|onto|via|than|between|among|across|"
+    r"within|without|through|under|over|about|after|before|during|per|versus|is|are|was|were|be|been|being|has|have|"
+    r"that|which|whose|where|its|their|our|this|these|those|both|each|such|not|using|e\.g\.|i\.e\.|al\.|cf\.|vs\.|"
+    r"figs?\.|eqs?\.|refs?\.|no\.)|[,&(\[{/–-])$", re.I)
 
 
 def _serialized_pdf(function: Callable[..., Any]) -> Callable[..., Any]:
@@ -130,6 +141,7 @@ def _line_from_spans(line: dict[str, Any]) -> dict[str, Any] | None:
     fragments: list[str] = []
     previous = None
     weighted_sizes: list[tuple[float, int]] = []
+    bold_chars = 0
     for span in spans:
         text = span.get("text", "")
         if previous and fragments and text and not fragments[-1].endswith(" ") and not text.startswith(" "):
@@ -138,6 +150,8 @@ def _line_from_spans(line: dict[str, Any]) -> dict[str, Any] | None:
                 fragments.append(" ")
         fragments.append(text)
         weighted_sizes.append((float(span.get("size", 10)), max(1, len(text.strip()))))
+        if span.get("flags", 0) & 16 or "bold" in span.get("font", "").lower():
+            bold_chars += len(text.strip())
         previous = span
     text = _clean_text("".join(fragments))
     if not text:
@@ -145,7 +159,9 @@ def _line_from_spans(line: dict[str, Any]) -> dict[str, Any] | None:
     size = sum(value * weight for value, weight in weighted_sizes) / sum(weight for _, weight in weighted_sizes)
     return {
         "text": text, "bbox": tuple(line["bbox"]), "size": size,
-        "bold": any(bool(span.get("flags", 0) & 16) or "bold" in span.get("font", "").lower() for span in spans),
+        # A bold run-in label ("Datasets.", "TF-Sapiens:") does not make the
+        # rest of its line a heading. Most of the characters must be bold.
+        "bold": bold_chars >= len(text.replace(" ", "")) * .6,
         "math_font": any(any(token in span.get("font", "").lower() for token in ("math", "symbol", "cmsy", "cmmi")) for span in spans),
     }
 
@@ -616,6 +632,7 @@ def _markdown_blocks(markdown: str, page: dict[str, Any],
     """
     original_lines = [(line, _alignment_key(line["text"]))
                       for group in page["groups"] for line in group]
+    column_lines = [line["bbox"] for line, key in original_lines if len(key) >= 40]
     page_figures = [figure for figure in figures or [] if figure["page"] == page["number"]]
     regions = [fitz.Rect(region) for figure in page_figures for region in figure.get("visual_regions", [])]
     table_regions = [fitz.Rect(figure["bbox"]) for figure in page_figures if figure["kind"] == "table"]
@@ -698,6 +715,11 @@ def _markdown_blocks(markdown: str, page: dict[str, Any],
             if visual:
                 kind = "table" if table_markup else "paragraph"
             previous = parts[-1] if parts else None
+            if (kind == "paragraph" and scope == "body" and previous is not None and previous["type"] == "heading"
+                    and previous["aligned"] and aligned and _heading_tail(previous, aligned[0], text, column_lines, page["body_size"])):
+                # The converter can begin a paragraph with the wrapped second
+                # line of the heading above it.
+                kind = "heading"
             separate = (previous is None or scope != previous["scope"] or
                         (kind == "heading") != (previous["type"] == "heading") or
                         caption_start or kind == "heading" and bool(_NAMED_SECTION.match(text)))
@@ -719,6 +741,130 @@ def _markdown_blocks(markdown: str, page: dict[str, Any],
                            "text_source": "markitdown", "geometry_matched": bool(aligned),
                            "translation_scope": part["scope"]})
     return blocks
+
+
+def _sentence_continues(left: str, right: str) -> bool:
+    """Whether two pieces of text clearly read as one sentence.
+
+    The left piece must stay open: it ends with a word or mark that cannot
+    close a sentence, or it ends without closing punctuation and the right
+    piece resumes in lower case. List items, captions and section numbers
+    begin their own unit unless the left piece is visibly unfinished.
+    """
+    left, right = left.rstrip(), right.lstrip()
+    if not left or not right or _CAPTION.match(right) or _NAMED_SECTION.match(right) or _NAMED_SECTION.match(left):
+        return False
+    open_end = bool(_OPEN_END.search(left))
+    if not open_end and _SENTENCE_END.search(left):
+        return False
+    if _ITEM_START.match(right) or (_SECTION.match(right) and not open_end):
+        return False
+    return open_end or bool(re.match(r"[a-z\u3400-\u9fff]", right.lstrip("(（[‘'\"“")))
+
+
+def _line_wraps(last: list[float] | tuple, right_text: str, size: float, columns: list[list[float]]) -> bool:
+    """Whether the next word could not fit on the last line of its column.
+
+    A heading or a prose line ends early by choice, but a wrapped line stops
+    because the first following word would overflow the column edge.
+    """
+    # The narrowest text regions around the line are its column, not a
+    # spanning abstract or a neighbouring column.
+    containers = [rect for rect in columns if rect[0] - size <= last[0] and last[2] <= rect[2] + size]
+    if not containers:
+        return False
+    narrowest = min(rect[2] - rect[0] for rect in containers)
+    column = [rect for rect in containers if rect[2] - rect[0] <= narrowest * 1.1 + size]
+    left, right = median(rect[0] for rect in column), median(rect[2] for rect in column)
+    word = re.match(r"[\u3400-\u9fff]|\S*", right_text.lstrip()).group(0)
+    # Latin glyphs average about half an em; a CJK character is one em.
+    width = size if re.match(r"[\u3400-\u9fff]", word) else len(word) * size * .45
+    # A long URL or identifier fits nowhere, so the line must also be full.
+    return last[2] - left >= (right - left) * .6 and last[2] + size * .25 + width >= right - size * .5
+
+
+def _heading_tail(part: dict[str, Any], line: dict[str, Any], text: str,
+                  columns: list[tuple], body_size: float) -> bool:
+    """Whether a converter line continues the heading part above it.
+
+    Only a heading set apart from prose by weight or size qualifies; a body
+    line taken for a numbered heading is repaired by _rejoin_split_sentences.
+    """
+    tail = part["aligned"][-1]
+    if not tail["bold"] and tail["size"] < body_size * 1.1:
+        return False
+    size = max(tail["size"], line["size"])
+    gap = line["bbox"][1] - tail["bbox"][3]
+    heading_text = _join_lines(part["lines"])
+    return (abs(tail["size"] - line["size"]) <= max(.3, size * .03) and tail["bold"] == line["bold"]
+            and -size * .3 <= gap <= size * .9 and _line_wraps(tail["bbox"], text, size, columns)
+            and _sentence_continues(heading_text, text) and _looks_like_heading(heading_text + " " + text))
+
+
+def _looks_like_heading(text: str) -> bool:
+    body = text[_SECTION.match(text).end():] if _SECTION.match(text) else text
+    return len(text) < 160 and not re.search(r"\S[.!?]\s+[A-Z]", body)
+
+
+def _rejoin_split_sentences(page: dict[str, Any]) -> None:
+    """Rejoin one sentence that layout analysis split around a heading.
+
+    A two-line heading can arrive as two headings, and a prose line opening
+    with a number or a bold label as a heading followed by its own remainder.
+    Adjacent lines of one column with a matching size are rejoined when the
+    first line wraps and the text reads as one sentence. Paragraph pairs are
+    left to _merge_prose_continuations, which also spans columns and pages.
+    """
+    # Text blocks of more than a short line show where each column ends.
+    columns = [block for block in page["blocks"] if block["type"] in {"paragraph", "heading"}
+               and len(block["text"]) >= 60 and block.get("geometry_matched") is not False]
+    merged: list[dict[str, Any]] = []
+    for block in page["blocks"]:
+        previous = merged[-1] if merged else None
+        if previous is None or not _sentence_split(previous, block, columns):
+            merged.append(block)
+            continue
+        text = _join_lines([{"text": previous["text"]}, {"text": block["text"]}])
+        heading = previous["type"] == block["type"] == "heading" and _looks_like_heading(text)
+        if not heading and previous["type"] == "heading":
+            previous["font_size"] = block["font_size"]
+        previous.update({"type": "heading" if heading else "paragraph", "text": text,
+                         "bbox": _bbox(fitz.Rect(previous["bbox"]) | fitz.Rect(block["bbox"])),
+                         "last_line_bbox": block["last_line_bbox"]})
+        previous.pop("text_zh", None)
+    page["blocks"] = merged
+
+
+def _sentence_split(previous: dict[str, Any], current: dict[str, Any], columns: list[dict[str, Any]]) -> bool:
+    kinds = (previous["type"], current["type"])
+    if "heading" not in kinds or not set(kinds) <= {"heading", "paragraph"}:
+        return False
+    if any(block.get("translation_scope", "body") != "body" or block.get("geometry_matched") is False
+           for block in (previous, current)):
+        return False
+    last, first = previous.get("last_line_bbox"), current.get("first_line_bbox")
+    if not last or not first:
+        return False
+    size = max(float(previous["font_size"]), float(current["font_size"]))
+    tolerance = max(.3, size * .03) if kinds == ("heading", "heading") else max(.6, size * .08)
+    if abs(float(previous["font_size"]) - float(current["font_size"])) > tolerance:
+        return False
+    gap = first[1] - last[3]
+    overlap = min(last[2], first[2]) - max(last[0], first[0])
+    # Double-spaced manuscripts leave more than one em between lines.
+    if not (-size * .3 <= gap <= size * 1.3 and overlap >= min(last[2] - last[0], first[2] - first[0]) * .5):
+        return False
+    # The pair itself cannot show where its own column ends.
+    if not _line_wraps(last, current["text"], size,
+                       [block["bbox"] for block in columns if block is not previous and block is not current]):
+        return False
+    if _sentence_continues(previous["text"], current["text"]):
+        return True
+    # Title-case headings resume in upper case. A wrapped numbered heading
+    # directly above an unnumbered line of the same size is still one title.
+    return (kinds == ("heading", "heading") and bool(_SECTION.match(previous["text"]))
+            and not _SECTION.match(current["text"]) and not _SENTENCE_END.search(previous["text"])
+            and gap <= size * .6 and _looks_like_heading(previous["text"] + " " + current["text"]))
 
 
 def _prose_continues(previous: dict[str, Any], current: dict[str, Any],
@@ -1560,6 +1706,9 @@ def extract_document(pdf_bytes: bytes, progress: Callable[[int], Any] | None = N
                     page["blocks"] = [block for block in page["blocks"] if block["id"] not in continuation_ids]
                 figure["caption"] = replacement["text"]
                 figure["caption_block_id"] = replacement["id"]
+        # Headings feed the title and the TOC, so restore them first.
+        for page in raw_pages:
+            _rejoin_split_sentences(page)
         title, authors, abstract, title_ids = _metadata(raw_pages, document.metadata or {})
         if progress:
             progress(72)
