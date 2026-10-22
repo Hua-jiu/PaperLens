@@ -1,8 +1,12 @@
 # User data: papers, notes, translations and API keys stay local
 /data/
 
-# Project-local Python runtimes, prepared per platform on first launch
+# Standalone runtimes ship in the GitHub Releases packages; a source
+# checkout downloads them on first launch
 /envs/
+
+# Release packages built locally
+/dist/
 
 # Local scratch files
 /tmp/
@@ -11,13 +15,16 @@ output/
 
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+# Windows native Python extensions (*.pyd) are required runtime files.
 
 # macOS
 .DS_Store
 .AppleDouble
 .LSOverride
-Icon?
+# Finder custom-icon files end in a control character; do not ignore Icons/.
+Icon[[:cntrl:]]
 ._*
 .DocumentRevisions-V100
 .fseventsd

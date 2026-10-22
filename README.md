@@ -24,7 +24,14 @@
 
 ### 1. 获取项目
 
-克隆仓库，或通过 GitHub 的 **Code → Download ZIP** 下载后完整解压。将项目放在可以读写的普通文件夹中。
+推荐从 GitHub 的 **Releases** 页面下载对应平台的完整包。完整包已包含独立 Python 运行环境和全部依赖，解压后即可使用：
+
+- macOS Apple Silicon：`PaperLens-<版本>-macos-arm64.zip`
+- Windows 10/11 x64：`PaperLens-<版本>-windows-x64.zip`
+
+也可以克隆仓库或下载源码 ZIP。源码不含运行环境，首次启动时会自动下载独立 Python 并安装依赖，需要能够访问 GitHub 和 Python 包索引。
+
+将项目放在可以读写的普通文件夹中。
 
 ### 2. 启动
 
@@ -34,15 +41,21 @@
 | macOS · Intel | 双击 `启动论文透镜.command` | 已提供对应运行时下载和启动流程，尚未实机验证 |
 | Windows 10/11 · x64 | 双击 `启动论文透镜.bat` | 已准备独立运行时和依赖，尚未完成 Windows 实机验证 |
 
-首次启动时，如果项目中没有可用的运行环境，启动程序会自动下载独立 Python、校验文件并安装依赖，需要能够访问 GitHub 和 Python 包索引。准备完成后，浏览器会自动打开：
+使用 Releases 完整包时，解压后直接双击对应入口，无需联网安装环境。浏览器会自动打开：
 
 ```text
 http://127.0.0.1:8765
 ```
 
-后续启动会复用 `envs/` 中的环境。保持启动窗口运行；在窗口中按 `Ctrl+C` 可停止服务，单独关闭浏览器页面不会停止后台服务。
+启动程序会检查并复用 `envs/` 中的环境。使用源码、macOS Intel，或环境缺失、损坏时，会尝试从 GitHub 下载对应运行时并从 Python 包索引补充依赖，需要联网。保持启动窗口运行；在窗口中按 `Ctrl+C` 可停止服务，单独关闭浏览器页面不会停止后台服务。
 
-macOS 下载后的文件如果没有执行权限，可在项目目录中执行：
+macOS 首次打开从网页下载的完整包时，系统可能提示“无法验证开发者”。可在终端中对解压后的目录执行一次：
+
+```sh
+xattr -dr com.apple.quarantine "解压后的 PaperLens 目录"
+```
+
+文件如果没有执行权限，可在项目目录中执行：
 
 ```sh
 chmod +x "启动论文透镜.command"
@@ -79,7 +92,7 @@ AI 重排等任务要求模型能够返回符合约定的 JSON。程序会校验
 - `data/library.sqlite3`：文献索引、模型配置、译文、总结、高亮、笔记和阅读记录。
 - `data/papers/`：导入的原始 PDF。
 
-备份或迁移时，先停止服务，再复制整个 `data/` 目录到另一份项目中。运行环境位于 `envs/`，与用户数据分开保存。
+备份或迁移时，先停止服务，再复制整个 `data/` 目录到另一份项目中。运行环境位于 `envs/`，随 Releases 完整包分发，与用户数据分开保存。
 
 原始 PDF 和阅读记录保存在本机。使用 AI 功能时，相关论文文本、选段或问题会发送至你配置的供应商；本地解析与原版 PDF 浏览不需要调用模型。API Key 保存在本机 SQLite 配置中，未额外加密，不应随源码或共享数据包公开。
 
@@ -87,10 +100,10 @@ AI 重排等任务要求模型能够返回符合约定的 JSON。程序会校验
 
 项目使用 Python Build Standalone 提供的 CPython 3.13.9，而非依赖本机解释器的普通虚拟环境。
 
-- macOS 按处理器架构使用 `envs/python-macos-arm64/` 或 `envs/python-macos-x86_64/`。
-- Windows 使用 `envs/python-windows-x86_64/`，必要的 C++ 运行库支持文件位于 `app/runtime-support/windows-x86_64/`。
+- 已附带 `envs/python-macos-arm64/`；macOS Intel 首次启动时会准备 `envs/python-macos-x86_64/`。
+- 已附带完整的 `envs/python-windows-x86_64/`，包含依赖和必要的 C++ 运行库；备用支持文件位于 `app/runtime-support/windows-x86_64/`。
 - 同一系统、同一架构下，可以连同准备好的环境一起复制项目；跨系统时共享应用代码和数据，由目标系统准备对应的运行时。
-- 完整环境准备好后，本地解析和阅读可离线运行；AI 功能是否需要联网取决于所配置的供应商。
+- 使用仓库已附带的完整环境，本地解析和阅读可离线运行；AI 功能仍需配置自己的供应商和 API Key，是否联网取决于供应商部署方式。
 
 ## 项目结构
 
@@ -115,7 +128,7 @@ paperlens/
 │   │   ├── pdf_engine.py       # 版面分析、图表定位与段落续接
 │   │   └── ai_service.py       # 模型调用、结果校验与恢复
 │   └── static/                 # 原生 HTML、CSS、JavaScript WebUI
-├── envs/                       # 项目独立运行环境，不纳入 Git
+├── envs/                       # 完整独立运行环境，随 Git 一起分发
 └── data/                       # 用户数据，不纳入 Git
 ```
 
@@ -132,7 +145,7 @@ paperlens/
 | `PAPERLENS_DRYRUN` | `0` | 设为 `1` 时使用内存数据，并禁用 AI 网络请求及环境自动安装 |
 | `PAPERLENS_SETUP_DRYRUN` | `0` | 设为 `1` 时，运行时安装脚本只输出准备计划 |
 
-已有完整运行环境时，可使用 dryrun 模式预览。macOS：
+使用仓库附带的完整运行环境，可直接以 dryrun 模式预览。macOS：
 
 ```sh
 PAPERLENS_DRYRUN=1 PAPERLENS_OPEN_BROWSER=0 ./启动论文透镜.command
@@ -146,7 +159,7 @@ set "PAPERLENS_OPEN_BROWSER=0"
 call "启动论文透镜.bat"
 ```
 
-dryrun 不会加载正式文献库，退出后内存中的上传与修改会丢弃。尚未准备环境时，先以正常模式完成首次配置。
+dryrun 不会加载正式文献库，退出后内存中的上传与修改会丢弃。环境缺失时，dryrun 不会下载安装，需要先以正常模式修复环境。
 
 ## 已知限制
 
@@ -156,8 +169,12 @@ dryrun 不会加载正式文献库，退出后内存中的上传与修改会丢�
 - 翻译、总结与问答的质量和费用取决于供应商及模型，阅读结论需结合原文判断。
 - “研究”页面尚未实现。
 
-## GitHub 源码与离线分发
+## GitHub 分发
 
-现有 `.gitignore` 已排除 `data/`、`envs/`、Python 缓存、系统文件及常规输出目录。源码仓库保留启动入口、`app/`、依赖清单和 Windows 运行库支持文件；用户下载源码后通过首次启动自动准备环境。
+`envs/` 随 Git 仓库一起提交，包含 macOS Apple Silicon 和 Windows x64 的独立 Python、依赖及相关授权文件。下载完整仓库后，保留目录结构并使用对应启动入口即可，无需单独安装 Python、Conda 或依赖包。
 
-如需提供无需首次下载环境的离线版本，可按系统和架构分别打包源码与已准备好的对应 `envs/`，作为 GitHub Release 附件分发。发布包不应包含个人 `data/`、API Key 或未经授权分享的论文。
+纳入 Git 的运行时文件合计约 483 MiB（未压缩），完整下载需要一定时间；实际 Git 传输大小取决于压缩效果。所有运行时文件均小于 GitHub 的 100 MB 单文件限制，当前采用普通 Git 提交，不依赖 Git LFS，也无需另行下载 Release 附件。
+
+`.gitattributes` 将 `envs/` 设为不进行文本换行转换，确保跨平台检出时保持原始字节。`.gitignore` 仅排除 Python 字节码、系统垃圾文件和安装过程的临时文件，保留 Windows 必需的 `.pyd`、`.dll` 及其他运行时组件。
+
+个人 `data/`、临时目录与常规输出仍被忽略。仓库不附带个人文献库、API Key 或论文；首次使用时请自行配置 AI 供应商并导入文献。
