@@ -40,7 +40,7 @@ class Application:
     def __init__(self, data_dir: Path, dryrun: bool = False):
         self.dryrun = dryrun
         self.store = Store(data_dir, dryrun=dryrun)
-        self.pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="paper-reader")
+        self.pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="paperlens")
         self.jobs: set[tuple[str, str]] = set()
         self.jobs_lock = threading.Lock()
         self.closing = False

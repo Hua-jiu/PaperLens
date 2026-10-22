@@ -27,7 +27,7 @@ class ReaderServer(ThreadingHTTPServer):
 
 
 class ReaderHandler(BaseHTTPRequestHandler):
-    server_version = "PaperReader/1.0"
+    server_version = "PaperLens/1.0"
 
     @property
     def app(self) -> Application:
@@ -62,7 +62,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
             path = unquote(parsed.path)
             query = parse_qs(parsed.query)
             if path == "/api/health" and self.command == "GET":
-                return self.respond({"ok": True, "app": "paper-read", "dry_run": self.app.dryrun})
+                return self.respond({"ok": True, "app": "paperlens", "dry_run": self.app.dryrun})
             if path == "/api/settings":
                 if self.command == "GET":
                     return self.respond(self.app.store.settings(public=True))

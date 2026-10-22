@@ -5,12 +5,12 @@ $PaperAppDir = $PSScriptRoot
 $PaperProjectDir = [System.IO.Directory]::GetParent($PaperAppDir).FullName
 $PaperRuntime = Join-Path $PaperProjectDir 'envs\python-windows-x86_64'
 $PaperPython = Join-Path $PaperRuntime 'python.exe'
-$PaperDryRun = $env:PAPER_READ_DRYRUN -eq '1'
+$PaperDryRun = $env:PAPERLENS_DRYRUN -eq '1'
 $PaperSupportNames = @('msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
 $PaperSupportDir = Join-Path $PaperAppDir 'runtime-support\windows-x86_64'
 
 if (-not [Environment]::Is64BitOperatingSystem) {
-    Write-Error '论文阅读器需要 64 位 Windows 10/11。'
+    Write-Error '论文透镜需要 64 位 Windows 10/11。'
     exit 1
 }
 foreach ($PaperName in @('PYTHONHOME', 'PYTHONPATH', 'PYTHONEXECUTABLE', 'PYTHONSAFEPATH', '__PYVENV_LAUNCHER__')) {
@@ -24,10 +24,10 @@ $env:PIP_NO_COMPILE = '1'
 function Test-PaperRuntime {
     if (-not [System.IO.File]::Exists($PaperPython)) { return $false }
     $ErrorActionPreference = 'SilentlyContinue'
-    $env:PAPER_READ_RUNTIME_CHECK = $PaperRuntime
+    $env:PAPERLENS_RUNTIME_CHECK = $PaperRuntime
     $PaperProbe = @'
 import os, pathlib, sqlite3, ssl, struct, sys
-root = pathlib.Path(os.environ['PAPER_READ_RUNTIME_CHECK']).resolve()
+root = pathlib.Path(os.environ['PAPERLENS_RUNTIME_CHECK']).resolve()
 assert sys.version_info[:3] == (3, 13, 9)
 assert struct.calcsize('P') == 8
 assert pathlib.Path(sys.executable).resolve().parent == root
@@ -45,12 +45,12 @@ assert pathlib.Path(sqlite3.__file__).resolve().is_relative_to(root)
 
 function Test-PaperDependencies {
     $ErrorActionPreference = 'SilentlyContinue'
-    $env:PAPER_READ_RUNTIME_CHECK = $PaperRuntime
+    $env:PAPERLENS_RUNTIME_CHECK = $PaperRuntime
     $PaperProbe = @'
 import os, pathlib, sys, pymupdf, markitdown, numpy, onnxruntime
 from markitdown.converters import PdfConverter
 from markitdown import StreamInfo
-root = pathlib.Path(os.environ['PAPER_READ_RUNTIME_CHECK']).resolve()
+root = pathlib.Path(os.environ['PAPERLENS_RUNTIME_CHECK']).resolve()
 for module in (pymupdf, markitdown, numpy, onnxruntime):
     assert pathlib.Path(module.__file__).resolve().is_relative_to(root)
 '@
@@ -118,7 +118,7 @@ try {
             if ($null -ne $PaperInstallLock) { $PaperInstallLock.Dispose() }
         }
     }
-    Remove-Item -LiteralPath 'Env:PAPER_READ_RUNTIME_CHECK' -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath 'Env:PAPERLENS_RUNTIME_CHECK' -ErrorAction SilentlyContinue
     $env:PATH = $PaperRuntime + ';' + (Join-Path $PaperRuntime 'Scripts') + ';' + $env:PATH
     & $PaperPython -B -E -s -X utf8 (Join-Path $PaperAppDir 'start.py')
     exit $LASTEXITCODE

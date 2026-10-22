@@ -35,7 +35,7 @@ assert pathlib.Path(sqlite3.__file__).resolve().is_relative_to(root)
 }
 
 if ! paper_runtime_valid; then
-  if [[ "${PAPER_READ_DRYRUN:-0}" == 1 ]]; then
+  if [[ "${PAPERLENS_DRYRUN:-0}" == 1 ]]; then
     print -u2 'dryrun 模式下内置 Python 不可用；不会下载或安装运行时。'
     exit 1
   fi
@@ -47,7 +47,7 @@ if ! paper_runtime_valid; then
 fi
 
 if ! "$PAPER_PYTHON" -I -B -c 'import pymupdf; from markitdown.converters import PdfConverter; from markitdown import StreamInfo' >/dev/null 2>&1; then
-  if [[ "${PAPER_READ_DRYRUN:-0}" == 1 ]]; then
+  if [[ "${PAPERLENS_DRYRUN:-0}" == 1 ]]; then
     print -u2 'dryrun 模式下项目依赖不完整；不会安装或修改环境。'
     exit 1
   fi

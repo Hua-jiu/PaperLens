@@ -1,4 +1,4 @@
-# Paper Read · AI 论文阅读器
+# PaperLens · 论文透镜
 
 一个在本机运行的 AI 论文阅读 WebUI，将文献管理、中文总结、双语阅读、图表浏览、划词问答和高亮笔记放在同一个工作空间中。
 
@@ -30,9 +30,9 @@
 
 | 系统 | 根目录启动入口 | 验证状态 |
 | --- | --- | --- |
-| macOS · Apple Silicon | 双击 `启动论文阅读器.command` | 已在 macOS arm64 环境验证 |
-| macOS · Intel | 双击 `启动论文阅读器.command` | 已提供对应运行时下载和启动流程，尚未实机验证 |
-| Windows 10/11 · x64 | 双击 `启动论文阅读器.bat` | 已准备独立运行时和依赖，尚未完成 Windows 实机验证 |
+| macOS · Apple Silicon | 双击 `启动论文透镜.command` | 已在 macOS arm64 环境验证 |
+| macOS · Intel | 双击 `启动论文透镜.command` | 已提供对应运行时下载和启动流程，尚未实机验证 |
+| Windows 10/11 · x64 | 双击 `启动论文透镜.bat` | 已准备独立运行时和依赖，尚未完成 Windows 实机验证 |
 
 首次启动时，如果项目中没有可用的运行环境，启动程序会自动下载独立 Python、校验文件并安装依赖，需要能够访问 GitHub 和 Python 包索引。准备完成后，浏览器会自动打开：
 
@@ -45,8 +45,8 @@ http://127.0.0.1:8765
 macOS 下载后的文件如果没有执行权限，可在项目目录中执行：
 
 ```sh
-chmod +x "启动论文阅读器.command"
-./启动论文阅读器.command
+chmod +x "启动论文透镜.command"
+./启动论文透镜.command
 ```
 
 目前没有提供 Linux 启动入口。
@@ -95,10 +95,10 @@ AI 重排等任务要求模型能够返回符合约定的 JSON。程序会校验
 ## 项目结构
 
 ```text
-paper-read/
+paperlens/
 ├── README.md
-├── 启动论文阅读器.command       # macOS 启动入口
-├── 启动论文阅读器.bat           # Windows 启动入口
+├── 启动论文透镜.command       # macOS 启动入口
+├── 启动论文透镜.bat           # Windows 启动入口
 ├── app/
 │   ├── start.py                # 本机 HTTP 服务入口与默认参数
 │   ├── bootstrap.py            # 项目内依赖安装
@@ -127,23 +127,23 @@ paper-read/
 
 | 变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `PAPER_READ_PORT` | `8765` | 本机服务端口 |
-| `PAPER_READ_OPEN_BROWSER` | `1` | 设为 `0` 时不自动打开浏览器 |
-| `PAPER_READ_DRYRUN` | `0` | 设为 `1` 时使用内存数据，并禁用 AI 网络请求及环境自动安装 |
-| `PAPER_READ_SETUP_DRYRUN` | `0` | 设为 `1` 时，运行时安装脚本只输出准备计划 |
+| `PAPERLENS_PORT` | `8765` | 本机服务端口 |
+| `PAPERLENS_OPEN_BROWSER` | `1` | 设为 `0` 时不自动打开浏览器 |
+| `PAPERLENS_DRYRUN` | `0` | 设为 `1` 时使用内存数据，并禁用 AI 网络请求及环境自动安装 |
+| `PAPERLENS_SETUP_DRYRUN` | `0` | 设为 `1` 时，运行时安装脚本只输出准备计划 |
 
 已有完整运行环境时，可使用 dryrun 模式预览。macOS：
 
 ```sh
-PAPER_READ_DRYRUN=1 PAPER_READ_OPEN_BROWSER=0 ./启动论文阅读器.command
+PAPERLENS_DRYRUN=1 PAPERLENS_OPEN_BROWSER=0 ./启动论文透镜.command
 ```
 
 Windows 命令提示符：
 
 ```bat
-set "PAPER_READ_DRYRUN=1"
-set "PAPER_READ_OPEN_BROWSER=0"
-call "启动论文阅读器.bat"
+set "PAPERLENS_DRYRUN=1"
+set "PAPERLENS_OPEN_BROWSER=0"
+call "启动论文透镜.bat"
 ```
 
 dryrun 不会加载正式文献库，退出后内存中的上传与修改会丢弃。尚未准备环境时，先以正常模式完成首次配置。

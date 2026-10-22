@@ -12,10 +12,10 @@ from urllib.request import urlopen
 
 DEFAULT_PARAMS = {
     "host": "127.0.0.1",
-    "port": int(os.environ.get("PAPER_READ_PORT", "8765")),
+    "port": int(os.environ.get("PAPERLENS_PORT", "8765")),
     "data_dir": (Path(__file__).resolve().parent.parent if Path(__file__).resolve().parent.name == "app" else Path(__file__).resolve().parent) / "data",
-    "open_browser": os.environ.get("PAPER_READ_OPEN_BROWSER", "1") == "1",
-    "dryrun": os.environ.get("PAPER_READ_DRYRUN", "0") == "1",
+    "open_browser": os.environ.get("PAPERLENS_OPEN_BROWSER", "1") == "1",
+    "dryrun": os.environ.get("PAPERLENS_DRYRUN", "0") == "1",
 }
 
 
@@ -37,17 +37,17 @@ def main(host=DEFAULT_PARAMS["host"], port=DEFAULT_PARAMS["port"],
             import json
             with urlopen(url + "/api/health", timeout=2) as response:
                 existing = json.load(response)
-            if existing.get("app") != "paper-read":
+            if existing.get("app") != "paperlens":
                 raise RuntimeError("该端口已被其他程序占用，请修改 app/start.py 顶部的 port")
             if bool(existing.get("dry_run")) != bool(dryrun):
                 raise RuntimeError("该端口已有不同运行模式的阅读器，请先停止已有服务或修改顶部 port")
-            print(f"论文阅读器已在运行：{url}")
+            print(f"论文透镜已在运行：{url}")
             if open_browser:
                 webbrowser.open(url)
             return
         except (OSError, URLError):
             raise RuntimeError(f"端口 {port} 已被占用，请修改 app/start.py 顶部的 port") from None
-    print(f"论文阅读器：{url}")
+    print(f"论文透镜：{url}")
     print("运行模式：dryrun（全部数据仅存内存，AI 网络请求停用）" if dryrun else f"数据目录：{Path(data_dir)}")
     print("按 Ctrl+C 停止服务。")
     if open_browser:
@@ -55,7 +55,7 @@ def main(host=DEFAULT_PARAMS["host"], port=DEFAULT_PARAMS["port"],
     try:
         server.serve_forever(poll_interval=.3)
     except KeyboardInterrupt:
-        print("\n正在关闭论文阅读器…")
+        print("\n正在关闭论文透镜…")
     finally:
         server.server_close()
         server.application.close()

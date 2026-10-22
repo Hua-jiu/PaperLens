@@ -8,7 +8,7 @@ $PaperSetupRuntime = Join-Path $PaperSetupEnvs 'python-windows-x86_64'
 $PaperSetupUrl = 'https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.13.9%2B20251014-x86_64-pc-windows-msvc-install_only_stripped.tar.gz'
 $PaperSetupSha = '76e0a9749c4deeb975a4b6b36d54be4e43f0c2a4c654bedab5d2e4d62dbc3006'
 
-if ($env:PAPER_READ_SETUP_DRYRUN -eq '1') {
+if ($env:PAPERLENS_SETUP_DRYRUN -eq '1') {
     Write-Output 'dryrun=True'
     Write-Output ('runtime=' + $PaperSetupRuntime)
     Write-Output ('url=' + $PaperSetupUrl)
@@ -16,7 +16,7 @@ if ($env:PAPER_READ_SETUP_DRYRUN -eq '1') {
     Write-Output 'plan=检查 Windows 独立 Python；缺失时下载、校验、暂存自检后安装；不依赖本机 Python。'
     return
 }
-if (-not [Environment]::Is64BitOperatingSystem) { throw '论文阅读器需要 64 位 Windows 10/11。' }
+if (-not [Environment]::Is64BitOperatingSystem) { throw '论文透镜需要 64 位 Windows 10/11。' }
 foreach ($PaperName in @('PYTHONHOME', 'PYTHONPATH', 'PYTHONEXECUTABLE', 'PYTHONSAFEPATH', '__PYVENV_LAUNCHER__')) {
     Remove-Item -LiteralPath ('Env:' + $PaperName) -ErrorAction SilentlyContinue
 }
@@ -29,10 +29,10 @@ function Test-PaperSetupRuntime {
     $PaperCheckPython = Join-Path $RuntimePath 'python.exe'
     if (-not [System.IO.File]::Exists($PaperCheckPython)) { return $false }
     $ErrorActionPreference = 'SilentlyContinue'
-    $env:PAPER_READ_RUNTIME_CHECK = $RuntimePath
+    $env:PAPERLENS_RUNTIME_CHECK = $RuntimePath
     $PaperProbe = @'
 import ensurepip, os, pathlib, sqlite3, ssl, struct, sys
-root = pathlib.Path(os.environ['PAPER_READ_RUNTIME_CHECK']).resolve()
+root = pathlib.Path(os.environ['PAPERLENS_RUNTIME_CHECK']).resolve()
 assert sys.version_info[:3] == (3, 13, 9)
 assert struct.calcsize('P') == 8
 assert pathlib.Path(sys.executable).resolve().parent == root

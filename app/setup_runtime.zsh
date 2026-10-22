@@ -26,7 +26,7 @@ esac
 PAPER_SETUP_RUNTIME="$PAPER_SETUP_ENVS/$PAPER_SETUP_TARGET"
 PAPER_SETUP_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.13.9%2B20251014-$PAPER_SETUP_TRIPLE-install_only_stripped.tar.gz"
 
-if [[ "${PAPER_READ_SETUP_DRYRUN:-0}" == 1 ]]; then
+if [[ "${PAPERLENS_SETUP_DRYRUN:-0}" == 1 ]]; then
   print -r -- 'dryrun=True'
   print -r -- "runtime=$PAPER_SETUP_RUNTIME"
   print -r -- "url=$PAPER_SETUP_URL"
