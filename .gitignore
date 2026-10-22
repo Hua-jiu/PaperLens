@@ -1,0 +1,33 @@
+# User data: papers, notes, translations and API keys stay local
+/data/
+
+# Project-local Python runtimes, prepared per platform on first launch
+/envs/
+
+# Local scratch files
+/tmp/
+output/
+.playwright-cli/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
