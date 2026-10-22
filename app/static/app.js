@@ -723,6 +723,8 @@ function pageHtml(page) {
   return `<section class="document-page" id="page-${Number(page.number)}" data-page="${Number(page.number)}"><div class="document-page-label">PAGE ${String(page.number).padStart(2, '0')}</div>${content}</section>`;
 }
 function blockHtml(block, page) {
+  // Figure labels and page furniture identified by the layout review.
+  if (block.hidden) return '';
   const type = /^[a-z_]+$/i.test(block.type || '') ? block.type : 'paragraph';
   if (type === 'figure' || type === 'image') { const figure = state.detail.document.figures.find(f => f.id === (block.figure_id || block.id)); if (figure) return figureHtml(figure); }
   if (block.translation_scope === 'figure_content' && state.detail.document.figures.some(figure => {

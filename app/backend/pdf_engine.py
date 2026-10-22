@@ -43,7 +43,9 @@ DEFAULT_REVIEW_KEY_CHARS = 60
 # contain several entries.
 DEFAULT_REVIEW_SPLIT_RATIO = 1.6
 DEFAULT_REVIEW_MAX_CANDIDATES = 160
-EXTRACTION_VERSION = 9
+# Roles the reviewer may assign to a block of uncertain kind.
+REVIEW_ROLES = ("body", "heading", "caption", "figure_text", "furniture")
+EXTRACTION_VERSION = 10
 
 # PyMuPDF does not support concurrent use from different threads, including
 # calls operating on separate documents. Every public entry point shares this
@@ -659,6 +661,8 @@ def _markdown_blocks(markdown: str, page: dict[str, Any],
                       for group in page["groups"] for line in group]
     column_lines = [line["bbox"] for line, key in original_lines if len(key) >= 40]
     page_figures = [figure for figure in figures or [] if figure["page"] == page["number"]]
+    figure_lines = [(line, key) for line, key in original_lines if len(key) >= 3 and any(
+        fitz.Rect(figure["bbox"]).contains(fitz.Rect(line["bbox"])) for figure in page_figures)]
     regions = [fitz.Rect(region) for figure in page_figures for region in figure.get("visual_regions", [])]
     table_regions = [fitz.Rect(figure["bbox"]) for figure in page_figures if figure["kind"] == "table"]
     active_table = table_regions[0] if table_regions else None
@@ -705,6 +709,13 @@ def _markdown_blocks(markdown: str, page: dict[str, Any],
                 inside_table = [line for line in aligned if active_table.contains(fitz.Rect(line["bbox"]))]
                 if inside_table:
                     aligned = inside_table
+            figure_text = False
+            if not aligned and figure_lines:
+                # Converters emit a figure's labels as one run without spaces,
+                # which matches no single line. Its pieces are figure lines.
+                covered = [line for line, key in figure_lines if key in comparable]
+                if sum(len(_alignment_key(line["text"])) for line in covered) >= len(comparable) * .5:
+                    aligned, figure_text = covered, True
             if not aligned and not table_markup and (len(comparable) < 25 or re.match(r"^https?://\S+$", text)):
                 continue
             rect = fitz.Rect(aligned[0]["bbox"]) if aligned else fitz.Rect(active_table) if table_markup else fitz.Rect(0, 0, page["width"], page["height"])
@@ -729,7 +740,7 @@ def _markdown_blocks(markdown: str, page: dict[str, Any],
             caption_start = bool(caption_match)
             if table_markup:
                 rect = fitz.Rect(active_table)
-            visual = not caption_start and (table_markup or any(region.contains(rect) for region in regions))
+            visual = not caption_start and (table_markup or figure_text or any(region.contains(rect) for region in regions))
             scope = "figure_content" if visual else "caption" if caption_start else "body"
             if parts and parts[-1]["scope"] == "caption" and not visual and not caption_start and not heading_marker:
                 # Keep the complete multi-line caption together, including its
@@ -900,6 +911,43 @@ def _ends_references(text: str) -> bool:
 
 def _references_heading(text: str) -> bool:
     return bool(_REFERENCES_HEADING.fullmatch(re.sub(r"\s+", "", text)))
+
+
+def _hide_repeated_furniture(pages: list[dict[str, Any]]) -> None:
+    """Hide converter text without a PDF position that recurs on many pages.
+
+    Watermarks, licence stamps and running footers can reach the converter
+    while lying outside the margins that _remove_margins inspects.
+    """
+    occurrences: dict[str, set[int]] = {}
+    for page in pages:
+        for block in page["blocks"]:
+            if block.get("geometry_matched") is False:
+                occurrences.setdefault(_margin_key(block["text"]), set()).add(page["number"])
+    needed = max(3, ceil(len(pages) * .25))
+    for page in pages:
+        for block in page["blocks"]:
+            if block.get("geometry_matched") is False and len(occurrences.get(_margin_key(block["text"]), ())) >= needed:
+                block["hidden"], block["translation_scope"] = True, "figure_content"
+
+
+def _mark_table_notes(pages: list[dict[str, Any]], figures: list[dict[str, Any]]) -> None:
+    """Treat smaller type directly below a table as its note, not as prose."""
+    for figure in figures:
+        if figure["kind"] != "table":
+            continue
+        page = pages[figure["page"] - 1]
+        bottom, table = figure["bbox"][3], figure["bbox"]
+        for block in sorted(page["blocks"], key=lambda item: item["bbox"][1]):
+            rect, size = block["bbox"], float(block["font_size"])
+            overlap = min(rect[2], table[2]) - max(rect[0], table[0])
+            if (block["type"] != "paragraph" or block.get("translation_scope", "body") != "body"
+                    or block.get("geometry_matched") is False or size > page["body_size"] * .93
+                    or overlap < min(rect[2] - rect[0], table[2] - table[0]) * .6
+                    or not -size <= rect[1] - bottom <= size * 2.5):
+                continue
+            block["type"], block["translation_scope"] = "caption", "caption"
+            bottom = rect[3]
 
 
 def _reference_marker(text: str) -> tuple[str, int] | None:
@@ -1490,8 +1538,10 @@ def layout_review_candidates(document: dict[str, Any]) -> list[dict[str, Any]]:
 
     A prose boundary qualifies when the left side does not end a sentence;
     reference boundaries and long entries qualify only in lists whose entries
-    could not be separated by numbering or a hanging indent. Candidates that
-    an earlier review already decided are omitted.
+    could not be separated by numbering or a hanging indent. A block's role
+    is questioned when it has no PDF position, is a heading with sentences,
+    or sits directly below a graphic. Candidates that an earlier review
+    already decided are omitted.
     """
     reviewed = set(document.get("layout_review", {}).get("reviewed", []))
     protected = {item.get("block_id") for item in document.get("toc", [])}
@@ -1533,6 +1583,30 @@ def layout_review_candidates(document: dict[str, Any]) -> list[dict[str, Any]]:
                                "before": _review_anchor(before, before_page, "tail"),
                                "after": _review_anchor(block, page["number"], "head"),
                                "before_text": excerpt(left, True), "after_text": excerpt(text, False)})
+    graphics: dict[int, list[list[float]]] = {}
+    for figure in document.get("figures", []):
+        if figure.get("bbox"):
+            graphics.setdefault(figure.get("page"), []).append(figure["bbox"])
+    for page in document.get("pages", []):
+        blocks = page.get("blocks", [])
+        for index, block in enumerate(blocks):
+            text = block.get("text", "").strip()
+            kind, scope = block.get("type"), block.get("translation_scope", "body")
+            if block.get("hidden") or block.get("layout_role") or scope != "body" or text in metadata or len(text) < 30:
+                continue
+            rect, size = block.get("bbox") or [0, 0, 0, 0], float(block.get("font_size") or 0)
+            # Converter text without a PDF position may be a figure's labels.
+            unplaced = block.get("geometry_matched") is False and kind == "paragraph"
+            long_heading = kind == "heading" and (len(text) > 120 or len(re.findall(r"[.!?]\s+[A-Z]", text)) >= 1)
+            below_graphic = kind == "paragraph" and any(
+                min(rect[2], area[2]) - max(rect[0], area[0]) >= min(rect[2] - rect[0], area[2] - area[0]) * .6
+                and -size <= rect[1] - area[3] <= size * 2.5 for area in graphics.get(page["number"], []))
+            if not (unplaced or long_heading or below_graphic):
+                continue
+            neighbours = [item.get("text", "") for item in (blocks[index - 1] if index else {}, blocks[index + 1] if index + 1 < len(blocks) else {})]
+            candidates.append({"kind": "role", "type": kind, "block": _review_anchor(block, page["number"], "head"),
+                               "text": text[:DEFAULT_REVIEW_CONTEXT_CHARS * 3],
+                               "before_text": excerpt(neighbours[0], True), "after_text": excerpt(neighbours[1], False)})
     references = [(page["number"], block) for page in document.get("pages", []) for block in page.get("blocks", [])
                   if block.get("type") == "reference"]
     typical = median(len(block["text"]) for _, block in references) if references else 0
@@ -1586,6 +1660,27 @@ def apply_layout_review(document: dict[str, Any], decisions: list[dict[str, Any]
     changed = False
     links = [list(pair) for pair in document.get("layout_links", [])]
     for decision in decisions:
+        if decision.get("kind") == "role":
+            found = _find_review_block(document, decision.get("block", {}))
+            role = decision.get("role")
+            if not found or role not in REVIEW_ROLES:
+                continue
+            block = found[1]
+            block["layout_role"] = role
+            if role in {"figure_text", "furniture"}:
+                block["hidden"] = True
+                block["translation_scope"] = "figure_content"
+                block.pop("text_zh", None)
+            else:
+                block.pop("hidden", None)
+                block["type"] = {"body": "paragraph", "heading": "heading", "caption": "caption"}[role]
+                block["translation_scope"] = "caption" if role == "caption" else "body"
+            if role != "heading":
+                # A heading title generated from this block no longer applies.
+                document["toc"] = [item for item in document.get("toc", [])
+                                   if item.get("block_id") != block["id"] or item.get("title") != block["text"]]
+            changed = True
+            continue
         if decision.get("kind") == "split":
             found = _find_review_block(document, decision.get("block", {}))
             if not found or found[1].get("type") != "reference":
@@ -2160,6 +2255,19 @@ def extract_document(pdf_bytes: bytes, progress: Callable[[int], Any] | None = N
         # the converter's complete captions below; no geometric body blocks
         # are retained when MarkItDown succeeds.
         figures = _make_figures(document, raw_pages)
+        # A page dominated by a table's small type would make its prose look
+        # like headings. Its body size ignores the text inside graphics.
+        for page in raw_pages:
+            areas = [fitz.Rect(figure["bbox"]) for figure in figures if figure["page"] == page["number"]]
+            if not areas:
+                continue
+            weighted = Counter()
+            for group in page["groups"]:
+                for line in group:
+                    if not any(area.contains(fitz.Rect(line["bbox"])) for area in areas):
+                        weighted[round(line["size"] * 2) / 2] += len(line["text"])
+            if weighted:
+                page["body_size"] = float(weighted.most_common(1)[0][0])
         warnings = []
         source_markdown = ""
         markdown_pages = []
@@ -2211,6 +2319,8 @@ def extract_document(pdf_bytes: bytes, progress: Callable[[int], Any] | None = N
                     page["blocks"] = [block for block in page["blocks"] if block["id"] not in continuation_ids]
                 figure["caption"] = replacement["text"]
                 figure["caption_block_id"] = replacement["id"]
+        _mark_table_notes(raw_pages, figures)
+        _hide_repeated_furniture(raw_pages)
         # Headings feed the title and the TOC, so restore them first.
         for page in raw_pages:
             _rejoin_split_sentences(page)

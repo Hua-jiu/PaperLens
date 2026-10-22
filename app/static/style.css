@@ -112,3 +112,9 @@
 .detail-banner h3,.detail-banner .original-title,.detail-banner .paper-author{white-space:normal;overflow-wrap:anywhere;word-break:normal}
 .detail-banner .paper-author{overflow:visible;text-overflow:clip;line-height:1.7}
 @media(max-width:680px){:root{--workspace-header-height:49px}.app-header,.reader-mode .app-header{gap:7px;padding-left:5px;padding-right:9px}.workspace-tabbar{gap:4px}.workspace-home{padding:0 9px;font-size:10px;gap:5px}.workspace-home>.icon{width:15px;height:15px}.document-tab{min-width:95px;max-width:180px;border-radius:6px}.document-tab-link{font-size:9px;padding:8px 2px 8px 8px;max-width:151px}.document-tab-link>.icon{width:12px;height:12px}.document-tab-close{margin:0 3px 0 1px}.document-tab-close>.icon{width:11px;height:11px}.workspace-settings{width:25px}.provider-model-control>.model-combobox{width:100%}}
+/* Sidebar text in dark ink; translations and metadata one step lighter. */
+.reader-sidebar .toc-original,.reader-sidebar .figure-caption p,.reader-sidebar .note-source,.reader-sidebar .point-item,.reader-sidebar .chat-message,.reader-sidebar .chat-message.user,.reader-sidebar .chat-welcome h3,.reader-sidebar .chat-input-box textarea{color:#1f1b24}
+.reader-sidebar .toc-translation,.reader-sidebar .figure-caption .figure-zh,.reader-sidebar .note-translation,.reader-sidebar .note-comment,.reader-sidebar .chat-welcome p,.reader-sidebar .chat-suggestion,.reader-sidebar .chat-selection,.reader-sidebar .side-empty,.reader-sidebar .processing-inline{color:#4a4351}
+.reader-sidebar .toc-page,.reader-sidebar .side-eyebrow,.reader-sidebar .figure-page,.reader-sidebar .note-actions span,.reader-sidebar .note-actions button,.reader-sidebar .chat-footnote,.reader-sidebar .chat-message.assistant:before,.reader-sidebar .point-number,.reader-sidebar .reader-tab{color:#6b6473}
+.reader-sidebar .reader-tab.active,.reader-sidebar .reader-tab:hover{color:#5b3f86}
+.reader-sidebar .chat-input-box textarea::placeholder{color:#8a8391}

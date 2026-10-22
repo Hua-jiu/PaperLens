@@ -432,6 +432,10 @@ def _content_signature(text: str) -> str:
     return re.sub(r"\s+", "", normalized.replace("\u00ad", ""))
 
 
+# Mirrors pdf_engine.REVIEW_ROLES; this module does not import the PDF engine.
+REVIEW_ROLES = ("body", "heading", "caption", "figure_text", "furniture")
+
+
 class AIService:
     def __init__(self, settings: dict[str, Any], dryrun: bool = False) -> None:
         if not isinstance(settings, dict):
@@ -843,11 +847,12 @@ class AIService:
         """Judge boundaries and reference entries that local rules leave open.
 
         Returns the accepted join IDs, the verbatim openings of further
-        entries per split candidate, and the IDs that received an answer. A
+        entries per split candidate, the role per role candidate, and the IDs
+        that received an answer. A
         batch whose answer stays invalid after one retry is left undecided.
         """
         self.review_warnings = []
-        result: dict[str, Any] = {"join": set(), "split": {}, "decided": set()}
+        result: dict[str, Any] = {"join": set(), "split": {}, "role": {}, "decided": set()}
         batches: list[list[dict[str, Any]]] = []
         current: list[dict[str, Any]] = []
         characters = 0
@@ -863,20 +868,24 @@ class AIService:
         for batch in batches:
             for attempt in range(2):
                 try:
-                    joins, splits = self._review_batch_once(batch)
+                    joins, splits, assigned = self._review_batch_once(batch)
                 except ModelResponseError as exc:
                     if attempt:
-                        self.review_warnings.append(f"有 {len(batch)} 处段落或参考文献边界未完成 AI 校对：{exc}")
+                        self.review_warnings.append(f"有 {len(batch)} 处段落、参考文献或版面块未完成 AI 校对：{exc}")
                     continue
                 result["join"].update(joins)
                 result["split"].update(splits)
+                result["role"].update(assigned)
                 result["decided"].update(candidate["id"] for candidate in batch)
                 break
         return result
 
-    def _review_batch_once(self, batch: list[dict[str, Any]]) -> tuple[set[str], dict[str, list[str]]]:
+    def _review_batch_once(self, batch: list[dict[str, Any]]) -> tuple[set[str], dict[str, list[str]], dict[str, str]]:
         boundaries = [{"id": item["id"], "type": item["type"], "before": item["before_text"], "after": item["after_text"]}
                       for item in batch if item["kind"] == "join"]
+        roles = [{"id": item["id"], "current": item["type"], "text": item["text"],
+                  "before": item["before_text"], "after": item["after_text"]}
+                 for item in batch if item["kind"] == "role"]
         entries = [{"id": item["id"], "text": item["text"]} for item in batch if item["kind"] == "split"]
         reply = self._complete(
             "reflow",
@@ -887,16 +896,24 @@ class AIService:
             "type 为 reference 时，若 after 是同一条参考文献的后续部分而不是新的一条文献，判为合并。"
             "entries 每项是一段可能包含多条参考文献的文本：若含有多条，按顺序给出第二条及之后每条文献开头的原文片段"
             "（逐字复制约 6 至 12 个词，必须能在 text 中原样找到）；只有一条时给空列表。"
-            "无法确定时不合并、不拆分。不改写、不翻译原文。"
-            '仅返回 JSON：{"join":["应合并的 boundary id"],"split":{"entry id":["后续文献开头的原文片段"]}}。',
-            json.dumps({"boundaries": boundaries, "entries": entries}, ensure_ascii=False),
+            "roles 每项是一个类型存疑的文本块 text，附前后文 before、after 与当前类型 current，判断它在阅读视图中的角色："
+            "body 正文段落；heading 章节标题；caption 图注或表注（含表格下方的注释）；"
+            "figure_text 图表内部的标签、坐标轴、图例或表格数据；furniture 页眉、页脚、版权、水印等版面杂项。"
+            "无法确定时不合并、不拆分，角色给 body。不改写、不翻译原文。"
+            '仅返回 JSON：{"join":["应合并的 boundary id"],"split":{"entry id":["后续文献开头的原文片段"]},'
+            '"role":{"role id":"body|heading|caption|figure_text|furniture"}}。',
+            json.dumps({"boundaries": boundaries, "entries": entries, "roles": roles}, ensure_ascii=False),
         )
         parsed = _strict_json(reply)
         if not isinstance(parsed, dict):
             raise ModelResponseError("AI 版面校对响应不是 JSON 对象。")
-        joins, splits = parsed.get("join", []), parsed.get("split", {})
+        joins, splits, assigned = parsed.get("join", []), parsed.get("split", {}), parsed.get("role", {})
         boundary_ids = {item["id"] for item in boundaries}
         entry_ids = {item["id"] for item in entries}
+        role_ids = {item["id"] for item in roles}
+        if not isinstance(assigned, dict) or any(identifier not in role_ids or value not in REVIEW_ROLES
+                                                 for identifier, value in assigned.items()):
+            raise ModelResponseError("AI 版面校对返回了无效的块角色。")
         if not isinstance(joins, list) or not isinstance(splits, dict):
             raise ModelResponseError("AI 版面校对响应缺少 join 列表或 split 对象。")
         if any(not isinstance(identifier, str) or identifier not in boundary_ids for identifier in joins):
@@ -907,7 +924,7 @@ class AIService:
                 raise ModelResponseError("AI 版面校对返回了无效的参考文献拆分。")
             if starts:
                 accepted[identifier] = starts
-        return set(joins), accepted
+        return set(joins), accepted, assigned
 
     def _preserve_reflow_batch(self, batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
         page = _page_number(batch[0])

@@ -377,6 +377,9 @@ class Application:
                 accepted.append({"kind": "join", "before": candidate["before"], "after": candidate["after"]})
             elif candidate["kind"] == "split" and candidate["id"] in review["split"]:
                 accepted.append({"kind": "split", "block": candidate["block"], "starts": review["split"][candidate["id"]]})
+            elif (candidate["kind"] == "role" and candidate["id"] in review["role"]
+                  and review["role"][candidate["id"]] != {"paragraph": "body"}.get(candidate["type"], candidate["type"])):
+                accepted.append({"kind": "role", "block": candidate["block"], "role": review["role"][candidate["id"]]})
 
         def save_review(record):
             document = record["document"]
@@ -790,7 +793,7 @@ def translation_targets(document: dict) -> list[dict]:
                                 "translated": has_text(group.get("text_zh"))})
                 emitted.add(group["id"])
         # Reference entries are read in their original language.
-        elif (has_text(block.get("text")) and block["id"] not in associated
+        elif (has_text(block.get("text")) and block["id"] not in associated and not block.get("hidden")
               and block.get("translation_scope") != "figure_content"
               and block.get("type") not in visual_types | {"reference"}):
             targets.append({"id": block["id"], "text": block["text"],
