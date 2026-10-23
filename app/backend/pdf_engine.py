@@ -45,7 +45,7 @@ DEFAULT_REVIEW_SPLIT_RATIO = 1.6
 DEFAULT_REVIEW_MAX_CANDIDATES = 160
 # Roles the reviewer may assign to a block of uncertain kind.
 REVIEW_ROLES = ("body", "heading", "caption", "figure_text", "furniture")
-EXTRACTION_VERSION = 10
+EXTRACTION_VERSION = 13
 
 # PyMuPDF does not support concurrent use from different threads, including
 # calls operating on separate documents. Every public entry point shares this
@@ -71,6 +71,9 @@ _INSTITUTION = re.compile(r"university|institute|department|laborator|school of|
 _PUBLISHER_NAVIGATION = re.compile(r"^(?:check\s+for\b|article\s*$|open\s+access\s*$|(?:download|view)\s+pdf\s*$)", re.I)
 _MATH = re.compile(r"[=∑∏∫√±∂∇≈≠≤≥∞∈∉⊂⊆⊕⊗∀∃→↦×÷α-ωΑ-Ω]")
 _EQUATION_NUMBER = re.compile(r"\(\s*[A-Z]?\d{1,3}[a-z]?\s*\)")
+# Some embedded fonts carry their weight only in the name: "AdvOT1234.B",
+# "Minion-Bd" or TeX's "CMBX10".
+_BOLD_FONT = re.compile(r"bold|black|heavy|semibold|demibold|^(?:[A-Z]{6}\+)?cmbx|[.\-_,](?:b|bd|bi|sb)$", re.I)
 _LIST_MARKER = re.compile(r"^(?:\[\d{1,3}\]|\d{1,3}[.)]|[•▪◦●■∙·*]|[-–—])\s+")
 # Compared without spaces, as letter-spaced small capitals ("RE FERENCES")
 # arrive with spaces inside the word.
@@ -177,7 +180,7 @@ def _line_from_spans(line: dict[str, Any]) -> dict[str, Any] | None:
                 fragments.append(" ")
         fragments.append(text)
         weighted_sizes.append((float(span.get("size", 10)), max(1, len(text.strip()))))
-        if span.get("flags", 0) & 16 or "bold" in span.get("font", "").lower():
+        if span.get("flags", 0) & 16 or _BOLD_FONT.search(span.get("font", "")):
             bold_chars += len(text.strip())
         previous = span
     text = _clean_text("".join(fragments))
@@ -218,7 +221,10 @@ def _classify(text: str, lines: list[dict[str, Any]], body_size: float) -> str:
         return "heading"
     if short and size >= body_size * 1.18 and not _INSTITUTION.search(text):
         return "heading"
-    if short and all(line["bold"] for line in lines) and size >= body_size * .97 and len(text) < 120 and not terminal_sentence:
+    # Bold author lines carry affiliation numbers, commas or footnote marks.
+    byline = bool(re.search(r"[A-Za-z]\d+(?:,\d+)*(?:\s|,|$)|[∗*†‡§]|^&", text)) or text.count(",") >= 2
+    if (short and all(line["bold"] for line in lines) and size >= body_size * .95 and len(text) < 120
+            and not terminal_sentence and not byline):
         return "heading"
     return "paragraph"
 
@@ -756,8 +762,14 @@ def _markdown_blocks(markdown: str, page: dict[str, Any],
                 # The converter can begin a paragraph with the wrapped second
                 # line of the heading above it.
                 kind = "heading"
+            # A complete section name, or a heading of another size, ends a
+            # heading even when the converter puts the next one on its line.
+            heading_level_change = (kind == "heading" and previous is not None and previous["type"] == "heading"
+                                    and (bool(_NAMED_SECTION.match(_join_lines(previous["lines"])))
+                                         or (aligned and previous["aligned"]
+                                             and abs(aligned[0]["size"] - previous["aligned"][-1]["size"]) > max(.6, aligned[0]["size"] * .08))))
             separate = (previous is None or scope != previous["scope"] or
-                        (kind == "heading") != (previous["type"] == "heading") or
+                        (kind == "heading") != (previous["type"] == "heading") or heading_level_change or
                         caption_start or kind == "heading" and bool(_NAMED_SECTION.match(text)))
             if separate:
                 parts.append({"type": kind, "scope": scope, "lines": [], "aligned": [], "rect": rect})
@@ -1003,7 +1015,9 @@ def _reference_regions(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             text, kind = block["text"].strip(), block["type"]
             same = abs(float(block["font_size"]) - size) <= max(.6, size * .08)
             bbox = block.get("bbox") or [0, 0, 0, 0]
-            if len(text) < 80 and (bbox[3] < candidate_page["height"] * .08 or bbox[1] > candidate_page["height"] * .9):
+            # An entry number at the top of a column belongs to the list.
+            if (len(text) < 80 and not _reference_marker(text) and not re.fullmatch(r"\[?\d{1,4}[.\]]", text)
+                    and (bbox[3] < candidate_page["height"] * .075 or bbox[1] > candidate_page["height"] * .93)):
                 # Running headers and folios neither end nor belong to a list.
                 index += 1
                 continue
@@ -1525,7 +1539,8 @@ def annotate_paragraph_groups(document: dict[str, Any]) -> None:
 def _review_anchor(block: dict[str, Any], page: int, end: str) -> dict[str, Any]:
     """Identify a block by page and text, as IDs change on re-extraction."""
     key = _alignment_key(block["text"])
-    return {"page": page, end: key[-DEFAULT_REVIEW_KEY_CHARS:] if end == "tail" else key[:DEFAULT_REVIEW_KEY_CHARS]}
+    return {"page": page, "type": block.get("type"),
+            end: key[-DEFAULT_REVIEW_KEY_CHARS:] if end == "tail" else key[:DEFAULT_REVIEW_KEY_CHARS]}
 
 
 def _review_signature(candidate: dict[str, Any]) -> str:
@@ -1562,6 +1577,10 @@ def layout_review_candidates(document: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             if kind not in {"paragraph", "reference"} or block.get("geometry_matched") is False or text in metadata:
                 previous = None
+                continue
+            # A running header such as the article DOI interrupts the prose
+            # it is printed between; it is neither side of the boundary.
+            if block.get("hidden") or re.fullmatch(r"(?:https?://|doi:?\s*)\S+", text, re.I):
                 continue
             pair = previous
             previous = (page["number"], block)
@@ -1622,6 +1641,8 @@ def layout_review_candidates(document: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _find_review_block(document: dict[str, Any], anchor: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Find a block by text; a converter can repeat text in another kind of block."""
+    found = []
     for page in document.get("pages", []):
         if page["number"] != anchor.get("page"):
             continue
@@ -1629,8 +1650,9 @@ def _find_review_block(document: dict[str, Any], anchor: dict[str, Any]) -> tupl
             key = _alignment_key(block.get("text", ""))
             if (("head" in anchor and anchor["head"] and key.startswith(anchor["head"]))
                     or ("tail" in anchor and anchor["tail"] and key.endswith(anchor["tail"]))):
-                return page, block
-    return None
+                found.append((page, block))
+    same_type = [item for item in found if item[1].get("type") == anchor.get("type")]
+    return (same_type or found or [None])[0]
 
 
 def _split_reference_text(text: str, starts: list[str]) -> list[str]:
@@ -1661,9 +1683,12 @@ def apply_layout_review(document: dict[str, Any], decisions: list[dict[str, Any]
     links = [list(pair) for pair in document.get("layout_links", [])]
     for decision in decisions:
         if decision.get("kind") == "role":
-            found = _find_review_block(document, decision.get("block", {}))
+            anchor = decision.get("block", {})
+            found = _find_review_block(document, anchor)
             role = decision.get("role")
-            if not found or role not in REVIEW_ROLES:
+            # A role was judged for one kind of block; text repeated in a
+            # block of another kind must keep its own role.
+            if not found or role not in REVIEW_ROLES or found[1].get("type") != anchor.get("type"):
                 continue
             block = found[1]
             block["layout_role"] = role
@@ -1706,6 +1731,8 @@ def apply_layout_review(document: dict[str, Any], decisions: list[dict[str, Any]
         if not before or not after or before[1] is after[1] or before[1].get("type") != after[1].get("type"):
             continue
         (before_page, first), (after_page, second) = before, after
+        if re.fullmatch(r"(?:https?://|doi:?\s*)\S+", first["text"].strip(), re.I):
+            continue
         if first.get("type") == "paragraph" and before_page is not after_page:
             if [first["id"], second["id"]] not in links:
                 links.append([first["id"], second["id"]])
@@ -1767,6 +1794,15 @@ def _metadata(pages: list[dict[str, Any]], pdf_metadata: dict[str, Any]) -> tupl
             if continuation:
                 authors += " " + continuation
             break
+    if not authors:
+        # A name can share its block with an affiliation and an e-mail address
+        # ("Ashish Vaswani∗ Google Brain ..."); its marked leading name counts.
+        names = []
+        for block in sorted(author_candidates, key=lambda block: (block["bbox"][1], block["bbox"][0])):
+            match = re.match(r"((?:[A-ZÀ-ÖØ-ÞŁ][\w'’.\-]*\s+){1,3}[A-ZÀ-ÖØ-ÞŁ][\w'’\-]+)\s*[∗*†‡]", block["text"])
+            if match and match.group(1) not in names:
+                names.append(match.group(1))
+        authors = ", ".join(names)
     if not authors:
         author_metadata = _clean_text(pdf_metadata.get("author") or "")
         if not _INSTITUTION.search(author_metadata) and not _PUBLISHER_NAVIGATION.match(author_metadata) and len(author_metadata) < 500:

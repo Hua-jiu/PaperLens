@@ -153,7 +153,7 @@ function closeDocument(id) {
   } else refreshWorkspaceTabs();
 }
 function render() {
-  document.title = state.page === 'reader' && state.detail ? `${state.detail.paper.title_zh || state.detail.paper.title} · 论文透镜` : '主页 · 论文阅读';
+  document.title = state.page === 'reader' && state.detail ? `${state.detail.paper.title_zh || state.detail.paper.title} · 论文透镜` : '主页 · 论文透镜';
   if (state.page === 'reader' && state.detail) return renderReader();
   app.className = '';
   app.innerHTML = `${header()}<div class="app-shell"><aside class="main-sidebar"><p class="sidebar-section-label">工作空间</p><nav aria-label="主导航"><button class="nav-item ${state.page === 'research' ? 'active' : ''}" data-action="navigate" data-page="research">${icon('research')}<span>研究</span>${state.page === 'research' ? '<i class="nav-dot"></i>' : ''}</button><button class="nav-item ${state.page === 'library' ? 'active' : ''}" data-action="navigate" data-page="library">${icon('book')}<span>文献库</span>${state.page === 'library' ? '<i class="nav-dot"></i>' : ''}</button></nav><div class="sidebar-footer"><div class="mini-logo">${icon('sparkles')}让理解更进一步</div><span>你的私人学术阅读空间</span></div></aside><main class="library-main" id="main-content">${state.page === 'research' ? `<div class="page-heading"><div><span class="eyebrow">RESEARCH</span><h1>研究</h1></div></div><div class="research-placeholder" aria-label="研究空白页">${icon('research')}</div>` : libraryHtml()}</main></div>`;
