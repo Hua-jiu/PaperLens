@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
-DEFAULT_MODULES = ("summary", "translation", "chat", "reflow")
+DEFAULT_MODULES = ("summary", "translation", "chat", "reflow", "vision")
 DEFAULT_SETTINGS = {
     "providers": [],
     "modules": {name: {"provider_id": "", "model": ""} for name in DEFAULT_MODULES},

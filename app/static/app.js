@@ -22,6 +22,7 @@ const moduleInfo = {
   translation: { name: '翻译', hint: '全文、目录、图注与划词', icon: 'translate' },
   chat: { name: 'AI 问答', hint: '论文问答与选段解释', icon: 'chat' },
   reflow: { name: 'AI 重排', hint: '阅读顺序、段落与参考文献校对', icon: 'layout' },
+  vision: { name: '版面识别', hint: '需支持图片输入；重新识别解析异常的页面', icon: 'image' },
 };
 const paths = {
   book: '<path d="M12 6c-2-2-6-2-9-1v14c3-1 7-1 9 1 2-2 6-2 9-1V5c-3-1-7-1-9 1Z"/><path d="M12 6v14"/>',
@@ -617,9 +618,17 @@ function translationNoticeHtml() {
   else if (state.showTranslation && !coverage.complete) { message = coverage.completed ? `已完成 ${coverage.completed} / ${coverage.total} 段，仍有正文或图注待翻译。` : '全文译文尚未生成。'; action = '<button data-action="retry-translation">继续翻译</button>'; }
   return message ? `<div class="document-warning translation-notice" role="status" aria-live="polite">${translationActivity(paper) ? '<span class="spinner"></span>' : ''}<span>${esc(message)} ${action}</span></div>` : '';
 }
+function layoutIssue(page) {
+  // A page confirmed broken by the AI spot check, or flagged locally.
+  if (page.vision_layout) return '';
+  const reason = state.detail.document.layout_inspection?.broken?.[page.number];
+  return reason || (page.layout_flags?.length ? '本地检测到该页版面可能有误' : '');
+}
 function documentNoticesHtml() {
   const { paper: p, document: doc } = state.detail;
-  return `${p.ai_status === 'processing' || p.ai_status === 'pending' ? `<div class="document-warning"><span class="processing-inline"><span class="spinner"></span>AI 正在优化阅读顺序与段落结构，你可以先开始阅读。</span></div>` : !p.summary && !p.ai_error ? `<div class="document-warning">当前显示已提取的阅读结构。<button data-action="settings">配置模型</button>后，将自动进行 AI 总结与结构优化。</div>` : p.ai_error ? `<div class="document-warning">${esc(p.ai_error)} <button data-action="reprocess">重新整理</button></div>` : ''}${p.layout_error && p.translation_status !== 'error' ? `<div class="document-warning">段落整理未完成：${esc(p.layout_error)}</div>` : ''}${translationNoticeHtml()}${(doc.warnings || []).map(w => `<div class="document-warning">${esc(w)}</div>`).join('')}`;
+  const broken = Object.keys(doc.layout_inspection?.broken || {}).map(Number).filter(number => doc.pages.some(page => page.number === number && !page.vision_layout));
+  const layoutNotice = broken.length ? `<div class="document-warning">AI 抽查发现第 ${broken.join('、')} 页的版面解析可能有误。可点击该页标记旁的“重新识别版面”，由视觉模型重新划分（需在设置中配置“版面识别”模型）。</div>` : '';
+  return `${layoutNotice}${p.ai_status === 'processing' || p.ai_status === 'pending' ? `<div class="document-warning"><span class="processing-inline"><span class="spinner"></span>AI 正在优化阅读顺序与段落结构，你可以先开始阅读。</span></div>` : !p.summary && !p.ai_error ? `<div class="document-warning">当前显示已提取的阅读结构。<button data-action="settings">配置模型</button>后，将自动进行 AI 总结与结构优化。</div>` : p.ai_error ? `<div class="document-warning">${esc(p.ai_error)} <button data-action="reprocess">重新整理</button></div>` : ''}${p.layout_error && p.translation_status !== 'error' ? `<div class="document-warning">段落整理未完成：${esc(p.layout_error)}</div>` : ''}${translationNoticeHtml()}${(doc.warnings || []).map(w => `<div class="document-warning">${esc(w)}</div>`).join('')}`;
 }
 function updateReader(previous = state.detail) {
   const session = openSession(); if (session && isCurrentPaper(session.id)) session.detail = state.detail;
@@ -720,7 +729,9 @@ function pageHtml(page) {
     } else content += blockHtml(block, page);
   }
   content += figures.filter(figure => !used.has(figure.id)).map(figureHtml).join('');
-  return `<section class="document-page" id="page-${Number(page.number)}" data-page="${Number(page.number)}"><div class="document-page-label">PAGE ${String(page.number).padStart(2, '0')}</div>${content}</section>`;
+  const issue = layoutIssue(page);
+  const action = issue ? `<button class="page-layout-action" data-action="revise-page" data-page="${Number(page.number)}" title="${attr(issue)}">重新识别版面</button>` : '';
+  return `<section class="document-page" id="page-${Number(page.number)}" data-page="${Number(page.number)}"><div class="document-page-label">PAGE ${String(page.number).padStart(2, '0')}${action}</div>${content}</section>`;
 }
 function blockHtml(block, page) {
   // Figure labels and page furniture identified by the layout review.
@@ -868,6 +879,12 @@ function updateTranslationPaper(paperId, patch) {
   const next = { ...detail, paper: { ...detail.paper, ...patch } };
   if (session) session.detail = next;
   if (active) { state.detail = next; if (state.page === 'reader') updateReader(detail); }
+}
+async function revisePage(button) {
+  const paperId = currentPaper().id, page = Number(button.dataset.page);
+  button.disabled = true;
+  try { await api(paperUrl(paperId, `/pages/${page}/vision`), { method: 'POST', body: '{}' }); if (isCurrentPaper(paperId)) toast(`已开始重新识别第 ${page} 页版面`, 'success'); }
+  catch (error) { if (isCurrentPaper(paperId)) toast(error.message, 'error'); if (button.isConnected) button.disabled = false; }
 }
 async function reprocess(button) {
   const paperId = currentPaper().id;
@@ -1030,6 +1047,7 @@ document.addEventListener('click', async event => {
       case 'translate-full': await translateFull(button); break;
       case 'retry-translation': await translateFull(button, true); break;
       case 'reprocess': await reprocess(button); break;
+      case 'revise-page': await revisePage(button); break;
       case 'jump': jumpTo(button.dataset.page, button.dataset.block); break;
       case 'jump-top': document.querySelector('#reader-canvas')?.scrollTo({ top: 0, behavior: 'smooth' }); break;
       case 'view-image': {

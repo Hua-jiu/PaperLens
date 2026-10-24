@@ -11,8 +11,9 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .ai_service import AIService, ConfigurationError, ModelResponseError
-from .pdf_engine import (EXTRACTION_VERSION, annotate_translation_scopes, apply_layout_review, extract_document,
-                         layout_review_candidates)
+from .pdf_engine import (DEFAULT_VISION_SCALE, EXTRACTION_VERSION, annotate_translation_scopes, apply_layout_review,
+                         apply_vision_layout, extract_document, layout_review_candidates, read_page_lines,
+                         render_page)
 from .storage import DEFAULT_MODULES, Store, timestamp
 
 MAX_UPLOAD_BYTES = 60 * 1024 * 1024
@@ -106,7 +107,16 @@ class Application:
         try:
             if self.store.get(paper_id)["document"].get("extraction_version", 0) >= EXTRACTION_VERSION:
                 return
-            extracted = extract_document(self.store.source(paper_id))
+            source = self.store.source(paper_id)
+            extracted = extract_document(source)
+            # Pages a vision model re-segmented keep that structure.
+            saved = self.store.get(paper_id)["document"].get("vision_layout", {})
+            for number, regions in saved.items():
+                try:
+                    apply_vision_layout(extracted, read_page_lines(source, int(number)), int(number), regions)
+                except (ValueError, StopIteration):
+                    continue
+            extracted["vision_layout"] = saved
 
             def merge(record):
                 current = record["document"]
@@ -321,6 +331,11 @@ class Application:
                 failures.append(safe_error(exc))
         if self.module_configured("reflow"):
             try:
+                self.update_paper(paper_id, stage="AI 抽查版面解析")
+                failures.extend(self.inspect_layout(paper_id, service))
+            except Exception as exc:
+                failures.append(safe_error(exc))
+            try:
                 self.update_paper(paper_id, stage="AI 校对段落与参考文献")
                 self.review_layout(paper_id, service)
                 failures.extend(service.review_warnings)
@@ -330,7 +345,8 @@ class Application:
                 self.update_paper(paper_id, stage="AI 优化段落与阅读顺序")
                 document = self.store.get(paper_id)["document"]
                 for page in document["pages"]:
-                    if not page["blocks"]:
+                    # A vision-segmented page already carries its reading order.
+                    if not page["blocks"] or page.get("vision_layout"):
                         continue
                     try:
                         blocks = service.reflow_blocks(page["blocks"])
@@ -358,6 +374,80 @@ class Application:
             except Exception as exc:
                 failures.append(safe_error(exc))
         self.update_paper(paper_id, ai_status="partial" if failures else "complete", stage="可阅读 · 部分 AI 任务失败" if failures else "准备就绪", ai_error="；".join(failures))
+
+    def inspect_layout(self, paper_id: str, service: AIService) -> list[str]:
+        """Spot-check locally flagged pages and re-segment the broken ones.
+
+        The text model confirms which flagged pages are clearly broken. With a
+        vision model configured those pages are re-segmented from their image;
+        otherwise they are listed for the reader as needing a manual check.
+        Returns warnings for pages that could not be inspected or repaired.
+        """
+        document = self.store.get(paper_id)["document"]
+        inspected = set(document.get("layout_inspection", {}).get("inspected", []))
+        pages = [{"page": page["number"], "signals": page["layout_flags"],
+                  "blocks": [{"type": block.get("type", "paragraph"), "text": block.get("text", "")}
+                             for block in page.get("blocks", []) if not block.get("hidden") and block.get("text")]}
+                 for page in document.get("pages", [])
+                 if page.get("layout_flags") and not page.get("vision_layout") and page["number"] not in inspected]
+        if not pages:
+            return []
+        broken = service.inspect_pages(pages)
+        warnings = list(service.inspection_warnings)
+        judged = [page["page"] for page in pages if not any(str(page["page"]) in warning for warning in warnings)]
+
+        def save_inspection(record):
+            state = record["document"].setdefault("layout_inspection", {"inspected": [], "broken": {}})
+            state["inspected"] = sorted(set(state["inspected"]) | set(judged))
+            state["broken"].update({str(number): reason for number, reason in broken.items()})
+
+        self.store.update(paper_id, save_inspection)
+        if broken and self.module_configured("vision"):
+            for number in sorted(broken):
+                try:
+                    self.update_paper(paper_id, stage=f"AI 重新识别第 {number} 页版面")
+                    self.revise_page_layout(paper_id, number, service)
+                except Exception as exc:
+                    warnings.append(f"第 {number} 页版面重新识别失败：{safe_error(exc)}")
+        return warnings
+
+    def revise_page_layout(self, paper_id: str, page: int, service: AIService | None = None) -> None:
+        """Re-segment one page with the vision model and store its regions."""
+        service = service or self.service()
+        source = self.store.source(paper_id)
+        regions = service.segment_page(render_page(source, page, DEFAULT_VISION_SCALE))
+        # PDF access stays outside the store lock; the locks are never nested
+        # in the reverse order. A trial run rejects regions before saving.
+        lines = read_page_lines(source, page)
+        apply_vision_layout(copy.deepcopy(self.store.get(paper_id)["document"]), lines, page, regions)
+
+        def save_vision(record):
+            before = copy.deepcopy(record["document"])
+            apply_vision_layout(record["document"], lines, page, regions)
+            record["document"].setdefault("vision_layout", {})[str(page)] = regions
+            record["document"].get("layout_inspection", {}).get("broken", {}).pop(str(page), None)
+            remap_document_anchors(record, before)
+            update_translation_state(record)
+
+        self.store.update(paper_id, save_vision)
+
+    def queue_page_layout(self, paper_id: str, page: int) -> dict:
+        self.require_module("vision")
+        record = self.store.get(paper_id)
+        if not 1 <= page <= max(1, record["paper"].get("page_count") or 0):
+            raise APIError("页码超出范围")
+
+        def work(identifier: str) -> None:
+            try:
+                self.revise_page_layout(identifier, page)
+                self.update_paper(identifier, ai_status="complete", stage="准备就绪", ai_error="")
+            except Exception as exc:
+                self.update_paper(identifier, ai_status="partial", stage="可阅读 · 部分 AI 任务失败",
+                                  ai_error=f"第 {page} 页版面重新识别失败：{safe_error(exc)}")
+
+        queued = self.submit(paper_id, f"vision-{page}", work, on_queued=lambda: self.update_paper(
+            paper_id, ai_status="processing", stage=f"AI 重新识别第 {page} 页版面", ai_error=""))
+        return {"ok": True, "queued": queued}
 
     def review_layout(self, paper_id: str, service: AIService) -> None:
         """Ask the model about uncertain boundaries and store its decisions.

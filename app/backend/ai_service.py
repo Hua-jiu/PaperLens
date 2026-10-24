@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import http.client
 import json
@@ -27,6 +28,10 @@ DEFAULT_REFLOW_RECOVERY_REQUESTS = 6
 DEFAULT_REFLOW_EXCERPT_CHARS = 360
 DEFAULT_REVIEW_BATCH_ITEMS = 40
 DEFAULT_REVIEW_BATCH_CHARS = 16_000
+DEFAULT_INSPECTION_BATCH_PAGES = 6
+DEFAULT_INSPECTION_BLOCKS = 40
+DEFAULT_INSPECTION_EXCERPT_CHARS = 160
+DEFAULT_VISION_MAX_REGIONS = 150
 DEFAULT_HISTORY_MESSAGES = 16
 DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 DEFAULT_SINGLE_TEXT_CHARS = 40_000
@@ -432,8 +437,10 @@ def _content_signature(text: str) -> str:
     return re.sub(r"\s+", "", normalized.replace("\u00ad", ""))
 
 
-# Mirrors pdf_engine.REVIEW_ROLES; this module does not import the PDF engine.
+# Mirror pdf_engine's lists; this module does not import the PDF engine.
 REVIEW_ROLES = ("body", "heading", "caption", "figure_text", "furniture")
+VISION_REGION_TYPES = ("title", "heading", "paragraph", "list", "caption", "figure", "table",
+                       "equation", "reference", "footnote", "header", "footer")
 
 
 class AIService:
@@ -585,6 +592,17 @@ class AIService:
             provider,
             model,
             [{"role": "system", "content": system + "\n" + _UNTRUSTED_DOCUMENT_RULE}, {"role": "user", "content": user}],
+            task=module,
+        )
+
+    def _complete_image(self, module: str, system: str, user: str, image: bytes) -> str:
+        provider, model = self._module(module)
+        url = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+        return self._request(
+            provider,
+            model,
+            [{"role": "system", "content": system + "\n" + _UNTRUSTED_DOCUMENT_RULE},
+             {"role": "user", "content": [{"type": "text", "text": user}, {"type": "image_url", "image_url": {"url": url}}]}],
             task=module,
         )
 
@@ -842,6 +860,91 @@ class AIService:
         for batch in batches:
             reordered.extend(self._reflow_batch_recover(batch, recovery_budget))
         return reordered
+
+    def inspect_pages(self, pages: list[dict[str, Any]]) -> dict[int, str]:
+        """Spot-check flagged pages; return the clearly broken ones with a reason.
+
+        Each page lists its extracted blocks in reading order with local
+        warning signs. A batch whose answer stays invalid is left unjudged.
+        """
+        self.inspection_warnings = []
+        broken: dict[int, str] = {}
+        for start in range(0, len(pages), DEFAULT_INSPECTION_BATCH_PAGES):
+            batch = pages[start:start + DEFAULT_INSPECTION_BATCH_PAGES]
+            payload = [{"page": page["page"], "signals": page["signals"],
+                        "blocks": [{"type": block["type"], "text": _reflow_excerpt(block["text"])[:DEFAULT_INSPECTION_EXCERPT_CHARS]}
+                                   for block in page["blocks"][:DEFAULT_INSPECTION_BLOCKS]]}
+                       for page in batch]
+            for attempt in range(2):
+                try:
+                    broken.update(self._inspect_batch_once(payload))
+                    break
+                except ModelResponseError as exc:
+                    if attempt:
+                        self.inspection_warnings.append(f"第 {'、'.join(str(page['page']) for page in batch)} 页未完成版面抽查：{exc}")
+        return broken
+
+    def _inspect_batch_once(self, payload: list[dict[str, Any]]) -> dict[int, str]:
+        reply = self._complete(
+            "reflow",
+            "你是 PDF 学术论文解析质量检查员。每页给出本地解析得到的文本块（按阅读顺序，较长文本只给开头与结尾）"
+            "及本地检测到的可疑信号 signals：unplaced 文本无对应位置，figure_text 图表内容混入正文，"
+            "fragmented 碎片过多，coverage 文字量与原文差异大。"
+            "判断每页的阅读结构是否明显损坏，例如：图表或公式内的标签、数字混入正文；作者、公式或段落被拆成大量碎片；"
+            "段落顺序错乱或同一内容重复；整段正文被标成标题。少量瑕疵不算损坏，无法确定时判为未损坏。"
+            '仅返回 JSON：{"pages":[{"page":页码,"broken":true或false,"reason":"一句中文原因"}]}，每个输入页恰好出现一次。',
+            json.dumps({"pages": payload}, ensure_ascii=False),
+        )
+        parsed = _strict_json(reply)
+        verdicts = parsed.get("pages") if isinstance(parsed, dict) else None
+        expected = {page["page"] for page in payload}
+        if not isinstance(verdicts, list):
+            raise ModelResponseError("版面抽查响应缺少 pages 列表。")
+        found: dict[int, str] = {}
+        seen: set[int] = set()
+        for verdict in verdicts:
+            number = verdict.get("page") if isinstance(verdict, dict) else None
+            if (not isinstance(number, int) or isinstance(number, bool) or number not in expected or number in seen
+                    or not isinstance(verdict.get("broken"), bool)):
+                raise ModelResponseError("版面抽查返回了未知、重复或格式无效的页码。")
+            seen.add(number)
+            if verdict["broken"]:
+                found[number] = _text(verdict.get("reason")).strip()[:200] or "版面解析明显有误"
+        if seen != expected:
+            raise ModelResponseError("版面抽查遗漏了页面。")
+        return found
+
+    def segment_page(self, image: bytes) -> list[dict[str, Any]]:
+        """Ask the vision model for a page's regions in reading order."""
+        reply = self._complete_image(
+            "vision",
+            "你是学术论文版面分析器。图片是 PDF 论文的一页。把页面划分为互不重叠的区域，并按人类阅读顺序列出："
+            "多栏版面先读完左栏再读右栏，跨栏的标题、图表与图注按其所在位置插入阅读顺序。"
+            "type 仅限：title 论文标题；heading 章节或小节标题；paragraph 正文段落（每段一个区域）；list 列表项；"
+            "caption 图注或表注；figure 图（包含图内所有标签、坐标轴与图例文字）；table 表格（包含表内全部文字）；"
+            "equation 独立成行的公式；reference 参考文献条目（每条一个区域）；footnote 脚注、作者单位、版权说明；"
+            "header 页眉；footer 页脚与页码。"
+            "bbox 为 [左, 上, 右, 下]，是以图片宽、高各为 1000 的归一化整数坐标。区域要完整包住其中的文字，不遗漏任何文字。",
+            '仅返回 JSON：{"regions":[{"type":"paragraph","bbox":[x0,y0,x1,y1]}]}',
+            image,
+        )
+        parsed = _strict_json(reply)
+        regions = parsed.get("regions") if isinstance(parsed, dict) else None
+        if not isinstance(regions, list) or not regions or len(regions) > DEFAULT_VISION_MAX_REGIONS:
+            raise ModelResponseError("视觉版面识别没有返回有效的区域列表。")
+        accepted = []
+        for region in regions:
+            bbox = region.get("bbox") if isinstance(region, dict) else None
+            if (not isinstance(region, dict) or region.get("type") not in VISION_REGION_TYPES or not isinstance(bbox, list)
+                    or len(bbox) != 4 or any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in bbox)):
+                raise ModelResponseError("视觉版面识别返回了无效的区域类型或坐标。")
+            x0, y0, x1, y1 = (min(1000.0, max(0.0, float(value))) for value in bbox)
+            if x1 - x0 < 2 or y1 - y0 < 2:
+                continue
+            accepted.append({"type": region["type"], "bbox": [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)]})
+        if not accepted:
+            raise ModelResponseError("视觉版面识别没有返回有效的区域。")
+        return accepted
 
     def review_layout(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
         """Judge boundaries and reference entries that local rules leave open.

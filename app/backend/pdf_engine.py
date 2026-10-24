@@ -45,7 +45,13 @@ DEFAULT_REVIEW_SPLIT_RATIO = 1.6
 DEFAULT_REVIEW_MAX_CANDIDATES = 160
 # Roles the reviewer may assign to a block of uncertain kind.
 REVIEW_ROLES = ("body", "heading", "caption", "figure_text", "furniture")
-EXTRACTION_VERSION = 13
+# Regions a vision model may draw on a page image, in 0-1000 coordinates.
+VISION_REGION_TYPES = ("title", "heading", "paragraph", "list", "caption", "figure", "table",
+                       "equation", "reference", "footnote", "header", "footer")
+DEFAULT_VISION_SCALE = 1.6
+# Share of a page's PDF text its regions must contain to be trusted.
+DEFAULT_VISION_MIN_COVERAGE = .85
+EXTRACTION_VERSION = 14
 
 # PyMuPDF does not support concurrent use from different threads, including
 # calls operating on separate documents. Every public entry point shares this
@@ -780,6 +786,10 @@ def _markdown_blocks(markdown: str, page: dict[str, Any],
         for part in parts:
             text = _join_lines(part["lines"], equation=part["type"] == "equation")
             aligned = part["aligned"]
+            # Large type alone does not make a heading: a lead paragraph or
+            # an unlabelled abstract runs over several lines of sentences.
+            if part["type"] == "heading" and len(part["lines"]) >= 4 and len(text) > 220 and re.search(r"[a-z][.!?]\s+[A-Z]", text):
+                part["type"] = "paragraph"
             blocks.append({"id": f"p{page['number']}-b{len(blocks) + 1}",
                            "page": page["number"], "type": part["type"], "text": text,
                            "bbox": _bbox(part["rect"]),
@@ -925,6 +935,40 @@ def _references_heading(text: str) -> bool:
     return bool(_REFERENCES_HEADING.fullmatch(re.sub(r"\s+", "", text)))
 
 
+def _layout_flags(page: dict[str, Any], raw: dict[str, Any], figures: list[dict[str, Any]]) -> list[str]:
+    """Name the signs that a page's reading layout went wrong.
+
+    ``unplaced``: much text has no PDF position.
+    ``figure_text``: converter table markup from a graphic sits in the prose.
+    ``fragmented``: many short scraps, as from split author lines or formulas.
+    ``coverage``: the reading text is much shorter or longer than the PDF text
+    outside graphics, so text is missing or repeated.
+    """
+    visible = [block for block in page["blocks"] if not block.get("hidden")
+               and block.get("translation_scope") != "figure_content" and block["type"] not in {"figure", "table"}]
+    characters = sum(len(block["text"]) for block in visible)
+    if not visible or characters < 200:
+        return []
+    unplaced = sum(len(block["text"]) for block in visible if block.get("geometry_matched") is False)
+    markup = [block for block in visible if block["type"] != "table" and block["text"].count("|") >= 4]
+    # Split author lines arrive as short "headings" as well.
+    scraps = [block for block in visible if len(block["text"].strip()) < 25 and block["type"] != "reference"
+              and not _NAMED_SECTION.match(block["text"].strip()) and not _SECTION.match(block["text"].strip())]
+    graphics = [fitz.Rect(figure["bbox"]) for figure in figures if figure["page"] == page["number"]]
+    source = sum(len(line["text"]) for group in raw["groups"] for line in group
+                 if not any(graphic.contains(fitz.Rect(line["bbox"])) for graphic in graphics))
+    flags = []
+    if unplaced >= max(200, characters * .15):
+        flags.append("unplaced")
+    if markup:
+        flags.append("figure_text")
+    if len(scraps) >= 6 and len(scraps) >= len(visible) * .3:
+        flags.append("fragmented")
+    if source >= 400 and not .7 <= characters / source <= 1.35:
+        flags.append("coverage")
+    return flags
+
+
 def _hide_repeated_furniture(pages: list[dict[str, Any]]) -> None:
     """Hide converter text without a PDF position that recurs on many pages.
 
@@ -1010,6 +1054,13 @@ def _reference_regions(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         size = median(float(block["font_size"]) for block in following[:8])
         members: list[tuple[dict[str, Any], dict[str, Any]]] = []
         end = None
+        # A heading low in the left column precedes the right column in
+        # reading order, although converters often emit that column first.
+        if heading["bbox"][2] < page["width"] * .55:
+            members += [(page, block) for block in page["blocks"][:page["blocks"].index(heading)]
+                        if block["bbox"][0] >= page["width"] * .45 and block["type"] in {"paragraph", "heading"}
+                        and block.get("geometry_matched") is not False
+                        and abs(float(block["font_size"]) - size) <= max(.6, size * .08)]
         while index < len(sequence):
             candidate_page, block = sequence[index]
             text, kind = block["text"].strip(), block["type"]
@@ -1265,6 +1316,9 @@ def _rebuild_references(pages: list[dict[str, Any]], figures: list[dict[str, Any
             else:
                 at = 0
             kept = [block for block in page["blocks"] if id(block) not in removed]
+            if number == start_page["number"]:
+                # Entries emitted before their heading still follow it.
+                at = kept.index(start) + 1 if start in kept else at
             references = placed.get(number, [])
             offset = sum(1 for block in kept if block["id"].startswith(f"p{number}-r"))
             for index, block in enumerate(references, offset + 1):
@@ -1809,6 +1863,9 @@ def _metadata(pages: list[dict[str, Any]], pdf_metadata: dict[str, Any]) -> tupl
             authors = author_metadata
     abstract_parts: list[str] = []
     started = False
+    # Some journals print an unlabelled abstract in larger type on page one.
+    lead = next((block for block in first["blocks"] if block["type"] == "paragraph" and len(block["text"]) >= 400
+                 and float(block["font_size"]) >= body_size * 1.1 and not _INSTITUTION.search(block["text"][:200])), None)
     for page in pages[:2]:
         for block in page["blocks"]:
             text = block["text"]
@@ -1825,6 +1882,8 @@ def _metadata(pages: list[dict[str, Any]], pdf_metadata: dict[str, Any]) -> tupl
                 return title[:1200], authors, _trim_abstract(" ".join(abstract_parts)), {block["id"] for block in title_blocks}
             if block["type"] == "paragraph":
                 abstract_parts.append(text)
+    if not abstract_parts and lead:
+        abstract_parts.append(lead["text"])
     return title[:1200], authors, _trim_abstract(" ".join(abstract_parts)), {block["id"] for block in title_blocks}
 
 
@@ -2267,6 +2326,106 @@ def annotate_translation_scopes(document: dict[str, Any], pdf_bytes: bytes | Non
 
 
 @_serialized_pdf
+def read_page_lines(pdf_bytes: bytes, page_number: int) -> list[dict[str, Any]]:
+    """Return a page's text lines for apply_vision_layout."""
+    with _open_pdf(pdf_bytes) as source:
+        raw = _read_page(source[_page_index(source, page_number)], page_number)
+    return [line for group in raw["groups"] for line in group]
+
+
+def apply_vision_layout(document: dict[str, Any], lines: list[dict[str, Any]], page_number: int,
+                        regions: list[dict[str, Any]]) -> None:
+    """Rebuild one page from the regions a vision model drew on its image.
+
+    The model decides only structure and order. Text always comes from the
+    PDF lines inside each region (see read_page_lines), so recognition errors
+    cannot enter it. Regions that miss too much text are rejected outright.
+    """
+    page = next(item for item in document["pages"] if item["number"] == page_number)
+    width, height = page["width"], page["height"]
+    rects = [fitz.Rect(*(float(value) * scale / 1000 for value, scale in zip(region["bbox"], (width, height, width, height))))
+             for region in regions]
+    owned: list[list[dict[str, Any]]] = [[] for _ in regions]
+    stray: list[dict[str, Any]] = []
+    total = assigned = 0
+    for line in lines:
+        center = fitz.Point((line["bbox"][0] + line["bbox"][2]) / 2, (line["bbox"][1] + line["bbox"][3]) / 2)
+        total += len(line["text"])
+        containing = [index for index, rect in enumerate(rects) if (rect + (-3, -3, 3, 3)).contains(center)]
+        if containing:
+            owned[min(containing, key=lambda index: rects[index].get_area())].append(line)
+            assigned += len(line["text"])
+        else:
+            stray.append(line)
+    if total and assigned < total * DEFAULT_VISION_MIN_COVERAGE:
+        raise ValueError(f"视觉识别的区域只覆盖第 {page_number} 页 {assigned * 100 // total}% 的文字，未采用。")
+    # Text just outside a drawn box joins the nearest text region.
+    textual = [index for index, region in enumerate(regions) if region["type"] not in {"figure", "table", "header", "footer"}]
+    for line in stray:
+        center = fitz.Point((line["bbox"][0] + line["bbox"][2]) / 2, (line["bbox"][1] + line["bbox"][3]) / 2)
+        if textual:
+            owned[min(textual, key=lambda index: rects[index].distance_to(center))].append(line)
+    translations = {" ".join(block["text"].split()): block["text_zh"] for block in page["blocks"] if block.get("text_zh")}
+    kinds = {"title": "heading", "heading": "heading", "paragraph": "paragraph", "list": "paragraph",
+             "footnote": "paragraph", "caption": "caption", "reference": "reference", "equation": "equation"}
+    blocks: list[dict[str, Any]] = []
+    figures: list[dict[str, Any]] = []
+    for index, (region, rect, members) in enumerate(zip(regions, rects, owned), 1):
+        kind, identifier = region["type"], f"p{page_number}-v{index}"
+        if kind in {"header", "footer"}:
+            continue
+        if kind in {"figure", "table"}:
+            figure = {"id": f"p{page_number}-vision-{kind}-{index}", "page": page_number, "kind": kind,
+                      "bbox": _bbox(rect), "visual_regions": [_bbox(rect)], "caption": "", "caption_zh": ""}
+            figures.append(figure)
+            blocks.append({"id": identifier, "page": page_number, "type": "figure", "figure_id": figure["id"], "text": "",
+                           "bbox": _bbox(rect), "font_size": 0, "translation_scope": "figure_content", "geometry_matched": True})
+            continue
+        if not members:
+            continue
+        # Joining baselines first returns superscripts to their line.
+        rows = sorted(_rebuild_lines(members), key=lambda row: (row["bbox"][1], row["bbox"][0]))
+        bounds = fitz.Rect(rows[0]["bbox"])
+        for row in rows[1:]:
+            bounds |= fitz.Rect(row["bbox"])
+        block = {"id": identifier, "page": page_number, "type": kinds[kind],
+                 "text": _join_lines(rows, equation=kind == "equation"), "bbox": _bbox(bounds),
+                 "first_line_bbox": _bbox(rows[0]["bbox"]), "last_line_bbox": _bbox(rows[-1]["bbox"]),
+                 "font_size": round(median(row["size"] for row in rows), 2), "text_source": "vision",
+                 "geometry_matched": True, "translation_scope": "caption" if kind == "caption" else "body"}
+        if kind == "equation":
+            block["display_math"] = True
+        if kind == "reference":
+            block["reference_confident"] = True
+        cached = translations.get(" ".join(block["text"].split()))
+        if cached and kind != "equation":
+            block["text_zh"] = cached
+        blocks.append(block)
+    # A figure's caption is the caption region next to it in reading order.
+    for figure in figures:
+        position = next(index for index, block in enumerate(blocks) if block.get("figure_id") == figure["id"])
+        for neighbour in (blocks[position + 1] if position + 1 < len(blocks) else None, blocks[position - 1] if position else None):
+            if neighbour and neighbour["type"] == "caption" and not any(item.get("caption_block_id") == neighbour["id"] for item in figures):
+                figure.update(caption=neighbour["text"], caption_block_id=neighbour["id"])
+                break
+    page["blocks"] = blocks
+    page.pop("layout_flags", None)
+    page["vision_layout"] = True
+    document["figures"] = [figure for figure in document.get("figures", []) if figure.get("page") != page_number] + figures
+    headings = [block for block in blocks if block["type"] == "heading"]
+    for item in document.get("toc", []):
+        if item.get("page") == page_number and item.get("block_id") not in {block["id"] for block in blocks}:
+            key = _alignment_key(item.get("title", ""))
+            match = next((block for block in headings if key and key in _alignment_key(block["text"])), None)
+            if match:
+                item["block_id"] = match["id"]
+            else:
+                item.pop("block_id", None)
+    annotate_translation_scopes(document)
+    annotate_paragraph_groups(document)
+
+
+@_serialized_pdf
 def extract_document(pdf_bytes: bytes, progress: Callable[[int], Any] | None = None) -> dict[str, Any]:
     """Extract a JSON-serializable reading layout without IO or OCR.
 
@@ -2382,6 +2541,10 @@ def extract_document(pdf_bytes: bytes, progress: Callable[[int], Any] | None = N
         annotate_translation_scopes(result)
         _merge_prose_continuations(result)
         annotate_paragraph_groups(result)
+        for page, raw in zip(result["pages"], raw_pages):
+            flags = _layout_flags(page, raw, figures)
+            if flags:
+                page["layout_flags"] = flags
         if progress:
             progress(100)
         return result

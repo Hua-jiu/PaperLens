@@ -160,6 +160,10 @@ class ReaderHandler(BaseHTTPRequestHandler):
         if action == "translate" and self.command == "POST":
             self.read_json()
             return self.respond(self.app.start_translation(paper_id))
+        page_layout = re.fullmatch(r"pages/(\d{1,4})/vision", action)
+        if page_layout and self.command == "POST":
+            self.read_json()
+            return self.respond(self.app.queue_page_layout(paper_id, int(page_layout.group(1))), 202)
         if action == "reprocess" and self.command == "POST":
             self.read_json()
             if record["paper"]["status"] == "error":

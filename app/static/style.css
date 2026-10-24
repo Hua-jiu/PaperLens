@@ -118,3 +118,5 @@
 .reader-sidebar .toc-page,.reader-sidebar .side-eyebrow,.reader-sidebar .figure-page,.reader-sidebar .note-actions span,.reader-sidebar .note-actions button,.reader-sidebar .chat-footnote,.reader-sidebar .chat-message.assistant:before,.reader-sidebar .point-number,.reader-sidebar .reader-tab{color:#6b6473}
 .reader-sidebar .reader-tab.active,.reader-sidebar .reader-tab:hover{color:#5b3f86}
 .reader-sidebar .chat-input-box textarea::placeholder{color:#8a8391}
+/* Page-level layout repair, placed after the label's rule. */
+.document-page-label:after{order:1}.page-layout-action{order:2;font-size:10px;letter-spacing:0;color:#7a5aa6;background:#f6f0fc;border:1px solid #e8dcf4;border-radius:5px;padding:3px 8px;user-select:none}.page-layout-action:hover{background:#efe5fa}.page-layout-action:disabled{opacity:.55}
