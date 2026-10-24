@@ -263,6 +263,18 @@ function normalizeDetail(detail) {
 }
 function currentPaper() { return state.detail?.paper; }
 function isCurrentPaper(id) { return currentPaper()?.id === id; }
+function patchChildren(container, html) {
+  const template = document.createElement('template'); template.innerHTML = html;
+  const current = [...container.childNodes], markup = node => node.nodeType === 1 ? node.outerHTML : node.textContent;
+  let cursor = 0;
+  const nodes = [...template.content.childNodes].map(node => {
+    const source = markup(node), found = current.findIndex((old, index) => index >= cursor && old._html === source);
+    if (found >= 0) { cursor = found + 1; return current[found]; }
+    node._html = source; return node;
+  });
+  nodes.forEach((node, index) => { if (container.childNodes[index] !== node) container.insertBefore(node, container.childNodes[index] || null); });
+  while (container.childNodes.length > nodes.length) container.lastChild.remove();
+}
 function closeModal() { if (state.modal === 'selection') ++selectionRequestToken; state.modal = null; renderModal(); }
 function renderModal() {
   closeModelPicker();
@@ -306,7 +318,21 @@ function renderModal() {
     title = state.figureTitle || '论文图表'; classes = 'image-modal';
     body = `<figure class="image-preview"><div class="image-stage"><img class="image-view" src="${attr(state.figureSrc)}" alt="${attr(title)}"${state.figureCaption ? ' aria-describedby="image-caption"' : ''}></div>${state.figureCaption ? `<figcaption class="image-view-caption" id="image-caption"><p>${esc(state.figureCaption)}</p>${state.figureCaptionZh ? `<p lang="zh-CN">${esc(state.figureCaptionZh)}</p>` : ''}</figcaption>` : ''}</figure>`;
   }
-  modalRoot.innerHTML = `<div class="modal-backdrop" data-backdrop="true"><section class="modal ${classes}" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-head"><div><h2 id="modal-title" tabindex="-1">${esc(title)}</h2>${subtitle ? `<p>${esc(subtitle)}</p>` : ''}</div><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('close')}</button></div><div class="modal-body">${body}</div>${foot ? `<div class="modal-foot">${foot}</div>` : ''}</section></div>`;
+  const head = `<div><h2 id="modal-title" tabindex="-1">${esc(title)}</h2>${subtitle ? `<p>${esc(subtitle)}</p>` : ''}</div><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('close')}</button>`;
+  const section = modalRoot.querySelector('.modal');
+  if (section?.dataset.modal === state.modal) {
+    // Re-rendering an open modal patches only what changed, so polling never replays the entrance or reloads its images.
+    section.className = `modal ${classes}`;
+    patchChildren(section.querySelector('.modal-head'), head); patchChildren(section.querySelector('.modal-body'), body);
+    let footer = section.querySelector('.modal-foot');
+    if (foot && !footer) { footer = document.createElement('div'); footer.className = 'modal-foot'; section.append(footer); }
+    if (foot) patchChildren(footer, foot); else footer?.remove();
+  } else {
+    modalRoot.innerHTML = `<div class="modal-backdrop" data-backdrop="true"><section class="modal ${classes}" data-modal="${attr(state.modal)}" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-head"></div><div class="modal-body"></div>${foot ? '<div class="modal-foot"></div>' : ''}</section></div>`;
+    const fresh = modalRoot.querySelector('.modal');
+    patchChildren(fresh.querySelector('.modal-head'), head); patchChildren(fresh.querySelector('.modal-body'), body);
+    if (foot) patchChildren(fresh.querySelector('.modal-foot'), foot);
+  }
   bindUpload(); bindImageFallbacks();
   modalRoot.querySelectorAll('.field').forEach((field, index) => {
     const label = field.querySelector('label'), input = field.querySelector('input,textarea,select');
