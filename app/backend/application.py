@@ -12,12 +12,14 @@ from uuid import uuid4
 
 from .ai_service import AIService, ConfigurationError, ModelResponseError
 from .pdf_engine import (DEFAULT_VISION_SCALE, EXTRACTION_VERSION, annotate_translation_scopes, apply_layout_review,
-                         apply_vision_layout, extract_document, layout_review_candidates, read_page_lines,
-                         render_page)
+                         apply_vision_layout, extract_document, layout_review_candidates, plan_regions,
+                         read_page_lines, read_page_resources, render_page)
 from .storage import DEFAULT_MODULES, Store, timestamp
 
 MAX_UPLOAD_BYTES = 60 * 1024 * 1024
 TRANSLATION_BATCH_SIZE = 8
+# Pages the layout planner arranges per document, one model request each.
+DEFAULT_PLAN_MAX_PAGES = 40
 
 
 class APIError(Exception):
@@ -109,7 +111,7 @@ class Application:
                 return
             source = self.store.source(paper_id)
             extracted = extract_document(source)
-            # Pages a vision model re-segmented keep that structure.
+            # Pages a model planned or re-segmented keep that structure.
             saved = self.store.get(paper_id)["document"].get("vision_layout", {})
             for number, regions in saved.items():
                 try:
@@ -313,26 +315,14 @@ class Application:
                 self.store.update(paper_id, save_summary)
             except Exception as exc:
                 failures.append(safe_error(exc))
-        if self.module_configured("translation"):
-            try:
-                self.update_paper(paper_id, stage="翻译目录与图注")
-                document = self.store.get(paper_id)["document"]
-                items = [{"id": "toc:" + item["id"], "text": item["title"]} for item in document["toc"]]
-                items += [{"id": "fig:" + item["id"], "text": item["caption"]} for item in document["figures"] if item.get("caption")]
-                for batch in batches(items):
-                    translated = service.translate_batch(batch)
-                    def save_metadata(current):
-                        for item in current["document"]["toc"]:
-                            item["title_zh"] = translated.get("toc:" + item["id"], item.get("title_zh", ""))
-                        for item in current["document"]["figures"]:
-                            item["caption_zh"] = translated.get("fig:" + item["id"], item.get("caption_zh", ""))
-                    self.store.update(paper_id, save_metadata)
-            except Exception as exc:
-                failures.append(safe_error(exc))
         if self.module_configured("reflow"):
             try:
                 self.update_paper(paper_id, stage="AI 抽查版面解析")
                 failures.extend(self.inspect_layout(paper_id, service))
+            except Exception as exc:
+                failures.append(safe_error(exc))
+            try:
+                failures.extend(self.plan_layout(paper_id, service))
             except Exception as exc:
                 failures.append(safe_error(exc))
             try:
@@ -345,7 +335,7 @@ class Application:
                 self.update_paper(paper_id, stage="AI 优化段落与阅读顺序")
                 document = self.store.get(paper_id)["document"]
                 for page in document["pages"]:
-                    # A vision-segmented page already carries its reading order.
+                    # A model-rebuilt page already carries its reading order.
                     if not page["blocks"] or page.get("vision_layout"):
                         continue
                     try:
@@ -373,15 +363,29 @@ class Application:
                     self.store.update(paper_id, save_reflow)
             except Exception as exc:
                 failures.append(safe_error(exc))
+        # Captions are translated after the layout steps have settled the figures.
+        if self.module_configured("translation"):
+            try:
+                self.update_paper(paper_id, stage="翻译目录与图注")
+                document = self.store.get(paper_id)["document"]
+                items = [{"id": "toc:" + item["id"], "text": item["title"]} for item in document["toc"]]
+                items += [{"id": "fig:" + item["id"], "text": item["caption"]} for item in document["figures"] if item.get("caption")]
+                for batch in batches(items):
+                    translated = service.translate_batch(batch)
+                    def save_metadata(current):
+                        for item in current["document"]["toc"]:
+                            item["title_zh"] = translated.get("toc:" + item["id"], item.get("title_zh", ""))
+                        for item in current["document"]["figures"]:
+                            item["caption_zh"] = translated.get("fig:" + item["id"], item.get("caption_zh", ""))
+                    self.store.update(paper_id, save_metadata)
+            except Exception as exc:
+                failures.append(safe_error(exc))
         self.update_paper(paper_id, ai_status="partial" if failures else "complete", stage="可阅读 · 部分 AI 任务失败" if failures else "准备就绪", ai_error="；".join(failures))
 
     def inspect_layout(self, paper_id: str, service: AIService) -> list[str]:
-        """Spot-check locally flagged pages and re-segment the broken ones.
+        """Spot-check locally flagged pages; plan_layout rebuilds the broken ones.
 
-        The text model confirms which flagged pages are clearly broken. With a
-        vision model configured those pages are re-segmented from their image;
-        otherwise they are listed for the reader as needing a manual check.
-        Returns warnings for pages that could not be inspected or repaired.
+        Returns warnings for pages that could not be inspected.
         """
         document = self.store.get(paper_id)["document"]
         inspected = set(document.get("layout_inspection", {}).get("inspected", []))
@@ -402,14 +406,65 @@ class Application:
             state["broken"].update({str(number): reason for number, reason in broken.items()})
 
         self.store.update(paper_id, save_inspection)
-        if broken and self.module_configured("vision"):
-            for number in sorted(broken):
-                try:
-                    self.update_paper(paper_id, stage=f"AI 重新识别第 {number} 页版面")
-                    self.revise_page_layout(paper_id, number, service)
-                except Exception as exc:
-                    warnings.append(f"第 {number} 页版面重新识别失败：{safe_error(exc)}")
         return warnings
+
+    def plan_layout(self, paper_id: str, service: AIService) -> list[str]:
+        """Let the model arrange pages whose figures or structure need it.
+
+        Pages holding figures, captions, figure text or a local or AI warning
+        are planned from their parsed resources; pages a model already
+        rebuilt are kept. A page the spot check found broken falls back to
+        the vision model when its plan is unusable. Returns warnings for
+        broken pages left as extracted.
+        """
+        document = self.store.get(paper_id)["document"]
+        figure_pages = {int(figure.get("page", 0)) for figure in document.get("figures", [])}
+        broken = {int(number) for number in document.get("layout_inspection", {}).get("broken", {})}
+        pages = [page["number"] for page in document.get("pages", []) if not page.get("vision_layout") and (
+            page["number"] in figure_pages | broken or page.get("layout_flags")
+            or any(block.get("type") == "caption" or block.get("translation_scope") == "figure_content"
+                   for block in page.get("blocks", [])))]
+        warnings = []
+        for number in pages[:DEFAULT_PLAN_MAX_PAGES]:
+            self.update_paper(paper_id, stage=f"AI 规划第 {number} 页版面")
+            try:
+                self.arrange_page(paper_id, number, service, vision=number in broken)
+            except (ModelResponseError, ValueError) as exc:
+                # One unusable plan leaves that page as extracted; provider
+                # and configuration errors stop the remaining pages. A page
+                # that only holds figures reads acceptably as extracted.
+                if number in broken:
+                    warnings.append(f"第 {number} 页版面重新整理未采用：{safe_error(exc)}")
+        return warnings
+
+    def arrange_page(self, paper_id: str, page: int, service: AIService | None = None, vision: bool = True) -> None:
+        """Plan a page from its text; with ``vision``, fall back to the vision model.
+
+        The plan works from the PDF's own text and graphics and is checked
+        group by group, so it comes first. Raises the last failure.
+        """
+        if not self.module_configured("reflow"):
+            return self.revise_page_layout(paper_id, page, service)
+        try:
+            self.plan_page_layout(paper_id, page, service)
+        except (ModelResponseError, ValueError):
+            if not (vision and self.module_configured("vision")):
+                raise
+            self.update_paper(paper_id, stage=f"AI 重新识别第 {page} 页版面")
+            self.revise_page_layout(paper_id, page, service)
+
+    def plan_page_layout(self, paper_id: str, page: int, service: AIService | None = None) -> None:
+        """Arrange one page with the text model from its parsed resources."""
+        service = service or self.service()
+        resources = read_page_resources(self.store.source(paper_id), page)
+        document = self.store.get(paper_id)["document"]
+        linked = {figure.get("caption_block_id") for figure in document.get("figures", [])}
+        # A figure's caption may sit on the facing page.
+        captions = [{"page": other["number"], "text": block["text"]} for other in document.get("pages", [])
+                    if abs(other["number"] - page) == 1 for block in other.get("blocks", [])
+                    if block.get("type") == "caption" and block["id"] not in linked and block.get("text")]
+        plan = service.plan_page({**resources, "page": page, "captions": captions})
+        self.save_page_layout(paper_id, page, resources["lines"], plan_regions(resources, plan))
 
     def revise_page_layout(self, paper_id: str, page: int, service: AIService | None = None) -> None:
         """Re-segment one page with the vision model and store its regions."""
@@ -417,11 +472,18 @@ class Application:
         source = self.store.source(paper_id)
         regions = service.segment_page(render_page(source, page, DEFAULT_VISION_SCALE))
         # PDF access stays outside the store lock; the locks are never nested
-        # in the reverse order. A trial run rejects regions before saving.
-        lines = read_page_lines(source, page)
+        # in the reverse order.
+        self.save_page_layout(paper_id, page, read_page_lines(source, page), regions)
+
+    def save_page_layout(self, paper_id: str, page: int, lines: list[dict], regions: list[dict]) -> None:
+        """Rebuild a page from model regions; a trial run rejects them before saving.
+
+        Vision and planned regions share ``vision_layout`` so both are applied
+        again after a re-extraction.
+        """
         apply_vision_layout(copy.deepcopy(self.store.get(paper_id)["document"]), lines, page, regions)
 
-        def save_vision(record):
+        def save_regions(record):
             before = copy.deepcopy(record["document"])
             apply_vision_layout(record["document"], lines, page, regions)
             record["document"].setdefault("vision_layout", {})[str(page)] = regions
@@ -429,17 +491,17 @@ class Application:
             remap_document_anchors(record, before)
             update_translation_state(record)
 
-        self.store.update(paper_id, save_vision)
+        self.store.update(paper_id, save_regions)
 
     def queue_page_layout(self, paper_id: str, page: int) -> dict:
-        self.require_module("vision")
+        self.require_module("reflow" if self.module_configured("reflow") else "vision")
         record = self.store.get(paper_id)
         if not 1 <= page <= max(1, record["paper"].get("page_count") or 0):
             raise APIError("页码超出范围")
 
         def work(identifier: str) -> None:
             try:
-                self.revise_page_layout(identifier, page)
+                self.arrange_page(identifier, page)
                 self.update_paper(identifier, ai_status="complete", stage="准备就绪", ai_error="")
             except Exception as exc:
                 self.update_paper(identifier, ai_status="partial", stage="可阅读 · 部分 AI 任务失败",

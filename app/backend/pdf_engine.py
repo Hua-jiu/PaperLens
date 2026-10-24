@@ -51,6 +51,10 @@ VISION_REGION_TYPES = ("title", "heading", "paragraph", "list", "caption", "figu
 DEFAULT_VISION_SCALE = 1.6
 # Share of a page's PDF text its regions must contain to be trusted.
 DEFAULT_VISION_MIN_COVERAGE = .85
+# Graphics offered to the layout planner: the largest drawn or embedded
+# regions of a page, ignoring rules and icons below this area (pt²).
+DEFAULT_PLAN_MAX_GRAPHICS = 40
+DEFAULT_PLAN_MIN_GRAPHIC_AREA = 1400
 EXTRACTION_VERSION = 14
 
 # PyMuPDF does not support concurrent use from different threads, including
@@ -2325,6 +2329,52 @@ def annotate_translation_scopes(document: dict[str, Any], pdf_bytes: bytes | Non
     return changed
 
 
+def _point_distance(rect: fitz.Rect, point: fitz.Point) -> float:
+    dx = max(rect.x0 - point.x, 0, point.x - rect.x1)
+    dy = max(rect.y0 - point.y, 0, point.y - rect.y1)
+    return (dx * dx + dy * dy) ** .5
+
+
+def _respacer(text: str) -> Callable[[str], str]:
+    """Restore word spaces a PDF line lacks from the converter's text.
+
+    Some justified PDFs position words without space glyphs, so their lines
+    read "wefirstcomparedthe". A line with such a run takes the spelling of
+    the same letters in ``text``; only whitespace can change.
+    """
+    key: list[str] = []
+    origin: list[int] = []
+    for position, character in enumerate(text):
+        for normalized in _alignment_key(character):
+            key.append(normalized)
+            origin.append(position)
+    joined = "".join(key)
+
+    def respace(line: str) -> str:
+        if not re.search(r"[^\W_]{25,}", line):
+            return line
+        wanted = _alignment_key(line)
+        start = joined.find(wanted) if len(wanted) >= 12 else -1
+        if start < 0:
+            return line
+        found = " ".join(text[origin[start]:origin[start + len(wanted) - 1] + 1].split())
+        return found if _alignment_key(found) == wanted else line
+
+    return respace
+
+
+def _figure_label(text: str) -> str:
+    """Normalize "Extended Data Fig. 2 |" or a planner's label to "edfig2"."""
+    text = str(text or "").strip()
+    prefix = re.match(r"^(extended\s+data|supplementary)\s+", text, re.I)
+    match = _CAPTION.match(text[prefix.end():] if prefix else text)
+    if not match:
+        return ""
+    label = re.sub(r"[^a-z0-9]", "", match.group(0).lower().replace("figure", "fig").replace("tables", "table"))
+    label = re.sub(r"^figs", "fig", label)
+    return (("ed" if prefix.group(1).lower().startswith("extended") else "s") + label) if prefix else label
+
+
 @_serialized_pdf
 def read_page_lines(pdf_bytes: bytes, page_number: int) -> list[dict[str, Any]]:
     """Return a page's text lines for apply_vision_layout."""
@@ -2333,58 +2383,186 @@ def read_page_lines(pdf_bytes: bytes, page_number: int) -> list[dict[str, Any]]:
     return [line for group in raw["groups"] for line in group]
 
 
+@_serialized_pdf
+def read_page_resources(pdf_bytes: bytes, page_number: int) -> dict[str, Any]:
+    """Collect one page's raw material for the layout planner.
+
+    Text comes as paragraph-sized line groups in the locally inferred reading
+    order, and graphics as the drawn or embedded regions, both in PDF
+    coordinates. ``lines`` are the same lines read_page_lines returns, for
+    apply_vision_layout.
+    """
+    with _open_pdf(pdf_bytes) as source:
+        page = source[_page_index(source, page_number)]
+        raw = _read_page(page, page_number)
+        images, drawings = _visual_regions(page)
+    lines = [line for group in raw["groups"] for line in group]
+    groups = []
+    for group in _group_lines(_rebuild_lines(lines)):
+        bounds = fitz.Rect(group[0]["bbox"])
+        for line in group[1:]:
+            bounds |= fitz.Rect(line["bbox"])
+        size = median(line["size"] for line in group)
+        # An indented first line opens a paragraph; a group continuing one
+        # from the previous column starts flush.
+        indent = len(group) > 1 and group[0]["bbox"][0] - min(line["bbox"][0] for line in group[1:]) > size * .8
+        groups.append({"bbox": _bbox(bounds), "size": round(size, 1), "bold": all(line.get("bold") for line in group),
+                       "indent": indent, "lines": len(group), "text": _join_lines(group)})
+    # Listing columns in order keeps the planner from interleaving them.
+    groups = _order_blocks(groups, raw["width"])
+    graphics = [{"bbox": _bbox(rect), "kind": kind} for kind, rects in (("image", images), ("drawing", drawings))
+                for rect in rects if rect.get_area() >= DEFAULT_PLAN_MIN_GRAPHIC_AREA]
+    graphics = sorted(graphics, key=lambda item: -fitz.Rect(item["bbox"]).get_area())[:DEFAULT_PLAN_MAX_GRAPHICS]
+    return {"width": raw["width"], "height": raw["height"], "body_size": raw["body_size"],
+            "lines": lines, "groups": groups, "graphics": graphics}
+
+
+def plan_regions(resources: dict[str, Any], plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn a planner's grouping of resource ids into stored page regions.
+
+    Each region keeps one box per member, in 0-1000 page coordinates, so it can
+    be applied again to a later re-extraction exactly like a vision region.
+    """
+    scale = (1000 / resources["width"], 1000 / resources["height"]) * 2
+    normalized = lambda bbox: [round(float(value) * factor, 1) for value, factor in zip(bbox, scale)]
+    regions = []
+    for item in plan:
+        boxes = [normalized(resources["groups"][index]["bbox"]) for index in item["members"]]
+        boxes += [normalized(resources["graphics"][index]["bbox"]) for index in item.get("graphics", [])]
+        region = {"type": item["type"], "boxes": boxes}
+        if item.get("label"):
+            region["label"] = item["label"]
+        regions.append(region)
+    return regions
+
+
+def _link_figure_captions(document: dict[str, Any]) -> None:
+    """Give an uncaptioned figure the caption that names it, on any page."""
+    linked = {figure.get("caption_block_id") for figure in document.get("figures", []) if figure.get("caption_block_id")}
+    captions = [(block.get("caption_label") or _figure_label(block.get("text", "")), block)
+                for page in document.get("pages", []) for block in page.get("blocks", [])
+                if block.get("type") == "caption" and block["id"] not in linked]
+    for figure in document.get("figures", []):
+        if figure.get("caption") or not figure.get("label"):
+            continue
+        match = next((block for label, block in captions if label == figure["label"] and block["id"] not in linked), None)
+        if match:
+            figure.update(caption=match["text"], caption_block_id=match["id"])
+            linked.add(match["id"])
+    # A figure without a label (a vision region) takes the one caption on a
+    # facing page that no figure names, preferring the page before it.
+    labels = {figure.get("label") for figure in document.get("figures", []) if figure.get("label")}
+    for figure in document.get("figures", []):
+        if figure.get("caption") or figure.get("label"):
+            continue
+        for offset in (-1, 1):
+            spare = [block for label, block in captions if label and label not in labels and block["id"] not in linked
+                     and block.get("page") == int(figure.get("page", 0)) + offset]
+            if len(spare) == 1:
+                figure.update(caption=spare[0]["text"], caption_block_id=spare[0]["id"])
+                linked.add(spare[0]["id"])
+                break
+
+
 def apply_vision_layout(document: dict[str, Any], lines: list[dict[str, Any]], page_number: int,
                         regions: list[dict[str, Any]]) -> None:
-    """Rebuild one page from the regions a vision model drew on its image.
+    """Rebuild one page from regions drawn by a vision model or a planner.
 
     The model decides only structure and order. Text always comes from the
     PDF lines inside each region (see read_page_lines), so recognition errors
     cannot enter it. Regions that miss too much text are rejected outright.
+    A vision region is one ``bbox``; a planned region lists several ``boxes``,
+    read in order (a caption continued in the next column, for example).
     """
     page = next(item for item in document["pages"] if item["number"] == page_number)
     width, height = page["width"], page["height"]
-    rects = [fitz.Rect(*(float(value) * scale / 1000 for value, scale in zip(region["bbox"], (width, height, width, height))))
-             for region in regions]
-    owned: list[list[dict[str, Any]]] = [[] for _ in regions]
+    # Reference entries were rebuilt across pages; an entry may hold lines of
+    # a facing page. They stay as extracted and their lines are not reused.
+    references = [block for block in page["blocks"] if block.get("type") == "reference"]
+    reference_text = "\n".join(_alignment_key(block.get("text", "")) for other in document["pages"]
+                               if abs(other["number"] - page_number) <= 1
+                               for block in other.get("blocks", []) if block.get("type") == "reference")
+    if reference_text:
+        lines = [line for line in lines if len(key := _alignment_key(line["text"])) < 8 or key not in reference_text]
+    to_rect =lambda box: fitz.Rect(*(float(value) * scale / 1000 for value, scale in zip(box, (width, height, width, height))))
+    region_boxes = [[to_rect(box) for box in region.get("boxes") or [region["bbox"]]] for region in regions]
+    boxes = [(index, order, rect) for index, rects in enumerate(region_boxes) for order, rect in enumerate(rects)]
+    owned: list[list[tuple[int, dict[str, Any]]]] = [[] for _ in regions]
     stray: list[dict[str, Any]] = []
     total = assigned = 0
     for line in lines:
         center = fitz.Point((line["bbox"][0] + line["bbox"][2]) / 2, (line["bbox"][1] + line["bbox"][3]) / 2)
         total += len(line["text"])
-        containing = [index for index, rect in enumerate(rects) if (rect + (-3, -3, 3, 3)).contains(center)]
+        containing = [box for box in boxes if (box[2] + (-3, -3, 3, 3)).contains(center)]
         if containing:
-            owned[min(containing, key=lambda index: rects[index].get_area())].append(line)
+            index, order, _ = min(containing, key=lambda box: box[2].get_area())
+            owned[index].append((order, line))
             assigned += len(line["text"])
         else:
             stray.append(line)
     if total and assigned < total * DEFAULT_VISION_MIN_COVERAGE:
-        raise ValueError(f"视觉识别的区域只覆盖第 {page_number} 页 {assigned * 100 // total}% 的文字，未采用。")
-    # Text just outside a drawn box joins the nearest text region.
-    textual = [index for index, region in enumerate(regions) if region["type"] not in {"figure", "table", "header", "footer"}]
+        raise ValueError(f"识别的区域只覆盖第 {page_number} 页 {assigned * 100 // total}% 的文字，未采用。")
+    textual = [box for box in boxes if regions[box[0]]["type"] not in {"figure", "table", "header", "footer"}]
+    pictured = [box for box in boxes if regions[box[0]]["type"] in {"figure", "table"}]
+    center = lambda line: fitz.Point((line["bbox"][0] + line["bbox"][2]) / 2, (line["bbox"][1] + line["bbox"][3]) / 2)
+    nearest = lambda candidates, line: min(((_point_distance(box[2], center(line)), box) for box in candidates),
+                                           key=lambda item: item[0], default=(float("inf"), None))
+    # A text box drawn slightly over a figure takes its labels along. Type
+    # smaller than the region's own text, at or beside a figure, returns to it.
+    for index, members in enumerate(owned):
+        if regions[index]["type"] in {"figure", "table", "header", "footer"} or len(members) < 2:
+            continue
+        size = median(line["size"] for _, line in members)
+        for order, line in list(members):
+            distance, target = nearest(pictured, line)
+            if target and distance <= 24 and line["size"] < size * .9:
+                members.remove((order, line))
+                owned[target[0]].append((target[1], line))
+    text_lines = [line for box in textual for _, line in owned[box[0]]]
+    text_size = median(line["size"] for line in text_lines) if text_lines else 0
+    # Text just outside every box joins the nearest region. A figure takes it
+    # only when closer than any text region and either adjacent or in the
+    # small type of figure labels.
     for line in stray:
-        center = fitz.Point((line["bbox"][0] + line["bbox"][2]) / 2, (line["bbox"][1] + line["bbox"][3]) / 2)
-        if textual:
-            owned[min(textual, key=lambda index: rects[index].distance_to(center))].append(line)
+        figure_distance, figure_box = nearest(pictured, line)
+        text_distance, text_box = nearest(textual, line)
+        small = line["size"] < text_size * .9
+        if figure_box and figure_distance < text_distance and (figure_distance <= 12 or (small and figure_distance <= 36)):
+            owned[figure_box[0]].append((figure_box[1], line))
+        elif text_box:
+            owned[text_box[0]].append((text_box[1], line))
     translations = {" ".join(block["text"].split()): block["text_zh"] for block in page["blocks"] if block.get("text_zh")}
+    # The extracted text of this page and its neighbours keeps word spaces
+    # (paragraphs may have been joined across a page break).
+    respace = _respacer("\n".join(block.get("text", "") for other in document["pages"]
+                                  if abs(other["number"] - page_number) <= 1 for block in other.get("blocks", [])))
     kinds = {"title": "heading", "heading": "heading", "paragraph": "paragraph", "list": "paragraph",
              "footnote": "paragraph", "caption": "caption", "reference": "reference", "equation": "equation"}
     blocks: list[dict[str, Any]] = []
     figures: list[dict[str, Any]] = []
-    for index, (region, rect, members) in enumerate(zip(regions, rects, owned), 1):
+    for index, (region, rects, members) in enumerate(zip(regions, region_boxes, owned), 1):
         kind, identifier = region["type"], f"p{page_number}-v{index}"
         if kind in {"header", "footer"}:
             continue
         if kind in {"figure", "table"}:
+            rect = fitz.Rect(rects[0])
+            for other in rects[1:]:
+                rect |= other
             figure = {"id": f"p{page_number}-vision-{kind}-{index}", "page": page_number, "kind": kind,
-                      "bbox": _bbox(rect), "visual_regions": [_bbox(rect)], "caption": "", "caption_zh": ""}
+                      "bbox": _bbox(rect), "visual_regions": [_bbox(item) for item in rects], "caption": "", "caption_zh": ""}
+            if _figure_label(region.get("label", "")):
+                figure["label"] = _figure_label(region["label"])
             figures.append(figure)
             blocks.append({"id": identifier, "page": page_number, "type": "figure", "figure_id": figure["id"], "text": "",
                            "bbox": _bbox(rect), "font_size": 0, "translation_scope": "figure_content", "geometry_matched": True})
             continue
         if not members:
             continue
-        # Joining baselines first returns superscripts to their line.
-        rows = sorted(_rebuild_lines(members), key=lambda row: (row["bbox"][1], row["bbox"][0]))
+        # Joining baselines first returns superscripts to their line. Each box
+        # is read top to bottom before the next one.
+        rows = [{**row, "text": respace(row["text"])} for order in sorted({order for order, _ in members})
+                for row in sorted(_rebuild_lines([line for position, line in members if position == order]),
+                                  key=lambda row: (row["bbox"][1], row["bbox"][0]))]
         bounds = fitz.Rect(rows[0]["bbox"])
         for row in rows[1:]:
             bounds |= fitz.Rect(row["bbox"])
@@ -2397,22 +2575,48 @@ def apply_vision_layout(document: dict[str, Any], lines: list[dict[str, Any]], p
             block["display_math"] = True
         if kind == "reference":
             block["reference_confident"] = True
+        if kind == "caption" and _figure_label(block["text"]):
+            block["caption_label"] = _figure_label(block["text"])
         cached = translations.get(" ".join(block["text"].split()))
         if cached and kind != "equation":
             block["text_zh"] = cached
         blocks.append(block)
-    # A figure's caption is the caption region next to it in reading order.
+    # A figure's caption is the one naming it, else the caption region next to
+    # it in reading order. Captions on another page are linked below.
+    taken = lambda block: any(item.get("caption_block_id") == block["id"] for item in figures)
     for figure in figures:
+        named = next((block for block in blocks if figure.get("label") and block.get("caption_label") == figure["label"]), None)
+        if named and not taken(named):
+            figure.update(caption=named["text"], caption_block_id=named["id"])
+            continue
         position = next(index for index, block in enumerate(blocks) if block.get("figure_id") == figure["id"])
         for neighbour in (blocks[position + 1] if position + 1 < len(blocks) else None, blocks[position - 1] if position else None):
-            if neighbour and neighbour["type"] == "caption" and not any(item.get("caption_block_id") == neighbour["id"] for item in figures):
+            # A caption naming another figure is never borrowed.
+            if (neighbour and neighbour["type"] == "caption" and not taken(neighbour)
+                    and not (figure.get("label") and neighbour.get("caption_label"))):
                 figure.update(caption=neighbour["text"], caption_block_id=neighbour["id"])
                 break
+    if references:
+        # After the list's heading, else where the list continues from the
+        # previous page, else after the page's text.
+        heading = next((index for index, block in enumerate(blocks)
+                        if block["type"] == "heading" and _references_heading(block["text"])), None)
+        continues = page["blocks"] and page["blocks"][0].get("type") == "reference"
+        position = heading + 1 if heading is not None else 0 if continues else len(blocks)
+        blocks[position:position] = references
     page["blocks"] = blocks
     page.pop("layout_flags", None)
     page["vision_layout"] = True
     document["figures"] = [figure for figure in document.get("figures", []) if figure.get("page") != page_number] + figures
-    headings = [block for block in blocks if block["type"] == "heading"]
+    # Another page's figure loses a caption block replaced here; it finds the
+    # rebuilt caption again by its label.
+    current = {block["id"] for block in blocks}
+    for figure in document["figures"]:
+        if str(figure.get("caption_block_id") or "").startswith(f"p{page_number}-") and figure["caption_block_id"] not in current:
+            figure.setdefault("label", _figure_label(figure.get("caption", "")))
+            figure.update(caption="", caption_block_id="")
+    _link_figure_captions(document)
+    headings =[block for block in blocks if block["type"] == "heading"]
     for item in document.get("toc", []):
         if item.get("page") == page_number and item.get("block_id") not in {block["id"] for block in blocks}:
             key = _alignment_key(item.get("title", ""))

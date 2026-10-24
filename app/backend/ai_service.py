@@ -32,6 +32,10 @@ DEFAULT_INSPECTION_BATCH_PAGES = 6
 DEFAULT_INSPECTION_BLOCKS = 40
 DEFAULT_INSPECTION_EXCERPT_CHARS = 160
 DEFAULT_VISION_MAX_REGIONS = 150
+DEFAULT_PLAN_EXCERPT_CHARS = 220
+DEFAULT_PLAN_CAPTION_CHARS = 160
+# An embedded image covering this share of the page must belong to a figure.
+DEFAULT_PLAN_MIN_IMAGE_SHARE = .02
 DEFAULT_HISTORY_MESSAGES = 16
 DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 DEFAULT_SINGLE_TEXT_CHARS = 40_000
@@ -430,11 +434,136 @@ def _reflow_excerpt(text: str) -> str:
     return text[:head] + " … " + text[-(DEFAULT_REFLOW_EXCERPT_CHARS - head):]
 
 
+def _plan_excerpt(text: str) -> str:
+    # The ending matters as much as the opening: it tells whether a sentence
+    # breaks off into the next group.
+    text = " ".join(text.split())
+    if len(text) <= DEFAULT_PLAN_EXCERPT_CHARS:
+        return text
+    head = DEFAULT_PLAN_EXCERPT_CHARS * 2 // 3
+    return text[:head] + " … " + text[-(DEFAULT_PLAN_EXCERPT_CHARS - head):]
+
+
 def _content_signature(text: str) -> str:
     # The only permitted non-whitespace edit is removing a line-break hyphen
     # inside an alphabetic word, or a PDF discretionary soft hyphen.
     normalized = re.sub(r"(?<=[A-Za-z])-\s*\n\s*(?=[A-Za-z])", "", text)
     return re.sub(r"\s+", "", normalized.replace("\u00ad", ""))
+
+
+# A caption opens with its figure's label: "Fig. 2 |", "Extended Data Table 1.".
+_CAPTION_START = re.compile(r"^(?:extended\s+data\s+|supplementary\s+)?(?:fig(?:ure)?s?\.?|table)\s*[A-Z]?\d+", re.I)
+
+
+def _separate_captions(region: dict[str, Any], groups: list[dict[str, Any]], graphics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Split a caption a planner left inside its figure region back out.
+
+    The caption is the group opening with a figure label plus the groups of
+    its type size that continue it outside the drawn graphics.
+    """
+    starts = [index for index in region["members"] if len(groups[index]["text"]) > 30
+              and _CAPTION_START.match(groups[index]["text"])]
+    if not starts:
+        return [region]
+    size = groups[starts[0]]["size"]
+    drawn = [graphics[index]["box"] for index in region["graphics"]]
+    top = min((box[1] for box in drawn), default=None)
+    bottom = max((box[3] for box in drawn), default=None)
+    first = groups[starts[0]]["box"]
+
+    def caption(index: int) -> bool:
+        box = groups[index]["box"]
+        if index in starts:
+            return True
+        if abs(groups[index]["size"] - size) > .3:
+            return False
+        if drawn:
+            return box[1] >= bottom - 2 or box[3] <= top + 2
+        return box[1] >= first[1]
+
+    moved = [index for index in region["members"] if caption(index)]
+    kept = {**region, "members": [index for index in region["members"] if index not in moved]}
+    return ([kept] if kept["members"] or kept["graphics"] else []) + [
+        {"type": "caption", "members": moved, "graphics": [], "label": ""}]
+
+
+def _tidy_plan(regions: list[dict[str, Any]], groups: list[dict[str, Any]], graphics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Correct planner slips that the page itself contradicts.
+
+    One figure label belongs to one figure region. A figure holds labels on
+    or beside its graphics, not a multi-line text block clear of all of
+    them: such a block joins the caption next to the figure when it shares
+    the caption's type size, else it is a paragraph. And an indented first
+    line, or a change of type size or weight, always opens a new paragraph.
+    """
+    overlaps = lambda a, b: min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+    result: list[dict[str, Any]] = []
+    labelled: dict[str, dict[str, Any]] = {}
+    for position, region in enumerate(regions):
+        # One figure split into several regions of the same label, or into
+        # consecutive regions without conflicting labels, is rejoined.
+        label = re.sub(r"[^a-z0-9]", "", region["label"].lower())
+        previous = result[-1] if result else None
+        joined = labelled.get(label) if label else None
+        if (region["type"] in {"figure", "table"} and joined is None and previous and previous["type"] == region["type"]
+                and (not label or not previous["label"])):
+            joined = previous
+        if region["type"] in {"figure", "table"} and joined is not None:
+            joined["members"] += region["members"]
+            joined["graphics"] += region["graphics"]
+            joined["label"] = joined["label"] or region["label"]
+            if label:
+                labelled[label] = joined
+            continue
+        if region["type"] == "figure" and region["graphics"]:
+            prose = [index for index in region["members"] if groups[index]["lines"] >= 4 and not any(
+                overlaps(groups[index]["box"], graphics[item]["box"]) for item in region["graphics"])]
+            if prose:
+                region = {**region, "members": [index for index in region["members"] if index not in prose]}
+                neighbours = [item for item in (result[-1] if result else None,
+                                                regions[position + 1] if position + 1 < len(regions) else None) if item]
+                caption = next((item for item in neighbours if item["type"] == "caption" and item["members"]
+                                and abs(groups[item["members"][0]]["size"] - groups[prose[0]]["size"]) <= .3), None)
+                if caption is not None:
+                    caption["members"] = sorted(caption["members"] + prose)
+                    prose = []
+                result.append(region)
+                if label:
+                    labelled[label] = region
+                result.extend({"type": "paragraph", "members": [index], "graphics": [], "label": ""} for index in prose)
+                continue
+        if region["type"] in {"paragraph", "list"} and len(region["members"]) > 1:
+            parts: list[list[int]] = []
+            for index in region["members"]:
+                previous = groups[parts[-1][-1]] if parts else None
+                if (previous is None or groups[index].get("indent") or bool(groups[index].get("bold")) != bool(previous.get("bold"))
+                        or abs(groups[index]["size"] - previous["size"]) > max(.5, previous["size"] * .08)):
+                    parts.append([])
+                parts[-1].append(index)
+            result.extend({**region, "members": part} for part in parts)
+            continue
+        result.append(region)
+        if region["type"] in {"figure", "table"} and label:
+            labelled[label] = region
+    # A continuation joined after a finished sentence belongs to the paragraph
+    # whose last group, the one just before it in local reading order, breaks
+    # off mid-sentence.
+    finished = lambda index: bool(re.search(r"[.!?。！？][\"'’”)\]]*\s*$", groups[index]["text"]))
+    owner = {index: region for region in result if region["type"] in {"paragraph", "list"} for index in region["members"]}
+    body = sorted(owner)
+    for region in [item for item in result if item["type"] in {"paragraph", "list"}]:
+        for position in range(1, len(region["members"])):
+            index = region["members"][position]
+            before = [item for item in body if item < index]
+            target = owner[before[-1]] if before else None
+            if (target is not None and target is not region and target["members"][-1] == before[-1]
+                    and not finished(before[-1]) and finished(region["members"][position - 1])):
+                moved = region["members"][position:]
+                region["members"] = region["members"][:position]
+                target["members"] += moved
+                owner.update({item: target for item in moved})
+                break
+    return [region for region in result if region["members"] or region["graphics"]]
 
 
 # Mirror pdf_engine's lists; this module does not import the PDF engine.
@@ -945,6 +1074,106 @@ class AIService:
         if not accepted:
             raise ModelResponseError("视觉版面识别没有返回有效的区域。")
         return accepted
+
+    def plan_page(self, page: dict[str, Any]) -> list[dict[str, Any]]:
+        """Plan one page's reading structure from its parsed resources.
+
+        ``page`` holds the text groups and graphics of read_page_resources and
+        the unpaired captions of neighbouring pages. Returns regions in reading
+        order, each naming its groups and graphics by index. An answer that is
+        still invalid after one retry raises ModelResponseError.
+        """
+        width, height = page["width"], page["height"]
+        box = lambda bbox: [round(float(value) * 1000 / scale) for value, scale in zip(bbox, (width, height, width, height))]
+        groups = [{"id": f"g{index + 1}", "box": box(group["bbox"]), "size": group["size"], "lines": group["lines"],
+                   **({"bold": True} if group["bold"] else {}), **({"indent": True} if group.get("indent") else {}),
+                   "text": _plan_excerpt(group["text"])}
+                  for index, group in enumerate(page["groups"])]
+        graphics = [{"id": f"r{index + 1}", "box": box(graphic["bbox"]), "kind": graphic["kind"]}
+                    for index, graphic in enumerate(page["graphics"])]
+        payload = {"page": page["page"], "body_size": page["body_size"], "groups": groups, "graphics": graphics,
+                   "nearby_captions": [{"page": caption["page"], "text": " ".join(caption["text"].split())[:DEFAULT_PLAN_CAPTION_CHARS]}
+                                       for caption in page.get("captions", [])]}
+        # Large photographs and plots must not vanish from the reading view.
+        required = {f"r{index + 1}" for index, graphic in enumerate(page["graphics"]) if graphic["kind"] == "image"
+                    and (graphic["bbox"][2] - graphic["bbox"][0]) * (graphic["bbox"][3] - graphic["bbox"][1])
+                    >= width * height * DEFAULT_PLAN_MIN_IMAGE_SHARE}
+        for attempt in range(2):
+            try:
+                return self._plan_page_once(payload, required)
+            except ModelResponseError:
+                if attempt:
+                    raise
+        return []
+
+    def _plan_page_once(self, payload: dict[str, Any], required: set[str]) -> list[dict[str, Any]]:
+        reply = self._complete(
+            "reflow",
+            "你是学术论文版面规划器。输入是从 PDF 某一页解析出的资源库：groups 是文本组（通常是一段文字、一行标题或一个图内标签，"
+            "较长文本只给开头与结尾），graphics 是页面上的图形区域（image 位图或 drawing 矢量绘图）。"
+            "box 为 [左, 上, 右, 下]，页面宽、高各归一化为 1000；size 为字号，正文字号为 body_size。"
+            "nearby_captions 是相邻页面上尚未配对图形的图注。"
+            "请规划这一页在阅读视图中的结构：把资源组织成区域 regions，按人类阅读顺序排列。"
+            "多栏版面先读完左栏再读右栏；跨栏的标题、图表与图注按其位置插入阅读顺序。"
+            "groups 已按本地推断的阅读顺序列出，通常正确，仅在确有错误时调整；"
+            "indent 表示首行缩进，即新段落的开始；左栏末尾未完的句子在右栏顶部接续时，两组属于同一段落。"
+            "type 仅限：title 论文标题；heading 章节或小节标题；paragraph 正文段落；list 列表项；"
+            "caption 图注或表注（含表格下方的注释）；figure 图；table 表格；equation 独立成行的公式；"
+            "reference 参考文献条目；footnote 作者、单位、收稿日期、脚注与版权说明；"
+            "header 页眉（含页面顶部的期刊名、文章类型标签与 DOI 链接）；footer 页脚与页码。"
+            "规则：1. 每个文本组 id 必须恰好出现在一个区域的 members 中，不得遗漏或重复。"
+            "2. 图表内部的文字（面板字母、坐标轴、图例、数据标签、流程图文字、表格单元）放入所属 figure 或 table 区域的 members，"
+            "该区域的 graphics 列出构成它的图形区域；同一张图的多块图形与标签合为一个 figure 区域，不要拆成多个。"
+            "3. 一个段落被换栏、换页或图表打断成多个文本组时，放进同一个区域，members 按阅读顺序排列；"
+            "不同段落各自成为区域。图注跨栏或被拆成多组时同样合为一个 caption 区域。"
+            "4. 以 Fig.、Figure、Table、Extended Data Fig. 等加编号开头的说明文字及其续接部分是图注，必须单独作为 caption 区域，"
+            "放在对应 figure 或 table 区域之后，不能并入 figure 或 table。"
+            "5. figure 与 table 区域给出 label，例如 \"Fig. 1\"、\"Table 2\"、\"Extended Data Fig. 3\"，"
+            "依据本页或 nearby_captions 中的图注判断；无法判断时给空字符串。"
+            "6. 不构成图表的图形（分隔线、背景色块、logo、图标）不必列出；较大的位图都应归入 figure 或 table。"
+            "不输出原文，不改写或翻译。"
+            '仅返回 JSON：{"regions":[{"type":"paragraph","members":["g1"],"graphics":[],"label":""}]}',
+            json.dumps(payload, ensure_ascii=False),
+        )
+        parsed = _strict_json(reply)
+        regions = parsed.get("regions") if isinstance(parsed, dict) else None
+        if not isinstance(regions, list) or not regions:
+            raise ModelResponseError("版面规划响应缺少 regions 列表。")
+        groups = {item["id"]: index for index, item in enumerate(payload["groups"])}
+        graphics = {item["id"]: index for index, item in enumerate(payload["graphics"])}
+        seen_groups: set[str] = set()
+        seen_graphics: set[str] = set()
+        accepted = []
+        for region in regions:
+            if not isinstance(region, dict) or region.get("type") not in VISION_REGION_TYPES:
+                raise ModelResponseError("版面规划返回了无效的区域类型。")
+            members, drawn = region.get("members", []), region.get("graphics", []) or []
+            if (not isinstance(members, list) or not isinstance(drawn, list)
+                    or any(not isinstance(item, str) for item in members + drawn)):
+                raise ModelResponseError("版面规划返回了无效的 members 或 graphics。")
+            # Text and graphic ids are told apart by their prefix, wherever listed.
+            members, drawn = ([item for item in members + drawn if item in groups],
+                              [item for item in members + drawn if item in graphics])
+            if len(members) + len(drawn) != len(region.get("members", [])) + len(region.get("graphics", []) or []):
+                raise ModelResponseError("版面规划出现未知的文本组或图形 id。")
+            # A group or graphic listed twice stays where it first appeared.
+            members = [item for item in dict.fromkeys(members) if item not in seen_groups]
+            drawn = [item for item in dict.fromkeys(drawn) if item not in seen_graphics]
+            seen_groups.update(members)
+            visual = region["type"] in {"figure", "table"}
+            if visual:
+                seen_graphics.update(drawn)
+            if not members and not (visual and drawn):
+                continue
+            label = region.get("label") if visual and isinstance(region.get("label"), str) else ""
+            planned = {"type": region["type"], "members": [groups[item] for item in members],
+                       "graphics": [graphics[item] for item in drawn] if visual else [], "label": label.strip()[:40]}
+            accepted.extend(_separate_captions(planned, payload["groups"], payload["graphics"]) if visual else [planned])
+        if seen_groups != set(groups):
+            raise ModelResponseError("版面规划遗漏了文本组。")
+        if not required <= seen_graphics:
+            raise ModelResponseError("版面规划遗漏了页面上的图片。")
+        return _tidy_plan(accepted, payload["groups"], payload["graphics"])
 
     def review_layout(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
         """Judge boundaries and reference entries that local rules leave open.

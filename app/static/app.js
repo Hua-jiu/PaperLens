@@ -21,7 +21,7 @@ const moduleInfo = {
   summary: { name: '论文总结', hint: '中文标题与概要', icon: 'sparkles' },
   translation: { name: '翻译', hint: '全文、目录、图注与划词', icon: 'translate' },
   chat: { name: 'AI 问答', hint: '论文问答与选段解释', icon: 'chat' },
-  reflow: { name: 'AI 重排', hint: '阅读顺序、段落与参考文献校对', icon: 'layout' },
+  reflow: { name: 'AI 重排', hint: '图表版面规划、阅读顺序、段落与参考文献校对', icon: 'layout' },
   vision: { name: '版面识别', hint: '需支持图片输入；重新识别解析异常的页面', icon: 'image' },
 };
 const paths = {
@@ -653,7 +653,7 @@ function layoutIssue(page) {
 function documentNoticesHtml() {
   const { paper: p, document: doc } = state.detail;
   const broken = Object.keys(doc.layout_inspection?.broken || {}).map(Number).filter(number => doc.pages.some(page => page.number === number && !page.vision_layout));
-  const layoutNotice = broken.length ? `<div class="document-warning">AI 抽查发现第 ${broken.join('、')} 页的版面解析可能有误。可点击该页标记旁的“重新识别版面”，由视觉模型重新划分（需在设置中配置“版面识别”模型）。</div>` : '';
+  const layoutNotice = broken.length ? `<div class="document-warning">AI 抽查发现第 ${broken.join('、')} 页的版面解析可能有误。可点击该页标记旁的“重新识别版面”，由“AI 重排”模型依据解析出的文本与图形重新规划；规划不成功且配置了“版面识别”模型时，改由视觉模型按页面图像划分。</div>` : '';
   return `${layoutNotice}${p.ai_status === 'processing' || p.ai_status === 'pending' ? `<div class="document-warning"><span class="processing-inline"><span class="spinner"></span>AI 正在优化阅读顺序与段落结构，你可以先开始阅读。</span></div>` : !p.summary && !p.ai_error ? `<div class="document-warning">当前显示已提取的阅读结构。<button data-action="settings">配置模型</button>后，将自动进行 AI 总结与结构优化。</div>` : p.ai_error ? `<div class="document-warning">${esc(p.ai_error)} <button data-action="reprocess">重新整理</button></div>` : ''}${p.layout_error && p.translation_status !== 'error' ? `<div class="document-warning">段落整理未完成：${esc(p.layout_error)}</div>` : ''}${translationNoticeHtml()}${(doc.warnings || []).map(w => `<div class="document-warning">${esc(w)}</div>`).join('')}`;
 }
 function updateReader(previous = state.detail) {
@@ -742,8 +742,11 @@ function pageHtml(page) {
   const figures = state.detail.document.figures.filter(figure => Number(figure.page) === Number(page.number));
   const used = new Set();
   const normalized = text => String(text || '').replace(/\s+/g, ' ').trim();
+  // A caption printed on the facing page is shown with its figure instead.
+  const movedCaptions = new Set(state.detail.document.figures.filter(figure => Number(figure.page) !== Number(page.number)).map(figure => figure.caption_block_id).filter(Boolean));
   let content = '';
   for (const block of page.blocks || []) {
+    if (movedCaptions.has(block.id)) continue;
     const figure = figures.find(item => (
       item.id === block.figure_id || item.caption_block_id === block.id || (['figure', 'image'].includes(block.type) && item.id === block.id) ||
       (item.caption && normalized(item.caption) === normalized(block.text))
